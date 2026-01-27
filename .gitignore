@@ -25,6 +25,7 @@ venv/
 ENV/
 env/
 .venv/
+venv*
 
 # Environment Variables
 .env
@@ -68,3 +69,6 @@ htmlcov/
 
 # mypy
 .mypy_cache/
+
+# folder
+untracked/
