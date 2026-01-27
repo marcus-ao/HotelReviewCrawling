@@ -67,15 +67,19 @@ class TaskScheduler:
             hotels = session.query(Hotel).filter(
                 Hotel.review_count >= 50  # 评论数大于50的酒店
             ).all()
-
+    
             for hotel in hotels:
                 # 检查是否已有任务
-                existing = session.query(CrawlTask).filter_by(
-                    task_type="review",
-                    hotel_id=hotel.hotel_id,
-                    status__in=["pending", "in_progress"]
+                from sqlalchemy import or_
+                existing = session.query(CrawlTask).filter(
+                    CrawlTask.task_type == "review",
+                    CrawlTask.hotel_id == hotel.hotel_id,
+                    or_(
+                        CrawlTask.status == "pending",
+                        CrawlTask.status == "in_progress"
+                    )
                 ).first()
-
+    
                 if existing:
                     continue
 
