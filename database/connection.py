@@ -90,9 +90,10 @@ def drop_all_tables() -> None:
 def check_connection() -> bool:
     """检查数据库连接是否正常"""
     try:
+        from sqlalchemy import text
         engine = get_engine()
         with engine.connect() as conn:
-            conn.execute("SELECT 1")
+            conn.execute(text("SELECT 1"))
         return True
     except Exception:
         return False
