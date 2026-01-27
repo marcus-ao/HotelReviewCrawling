@@ -41,6 +41,23 @@ class ReviewCrawler:
         self.anti_crawler = anti_crawler or AntiCrawler()
         self.crawled_review_ids = set()  # 用于去重
 
+    def _generate_review_id(self, hotel_id: str, content: str, user_nick: str = None) -> str:
+        """生成唯一的评论ID
+        
+        Args:
+            hotel_id: 酒店ID
+            content: 评论内容
+            user_nick: 用户昵称（可选）
+        
+        Returns:
+            唯一的评论ID
+        """
+        import hashlib
+        # 组合多个字段以降低冲突概率
+        unique_str = f"{hotel_id}_{content}_{user_nick or ''}"
+        hash_value = hashlib.md5(unique_str.encode('utf-8')).hexdigest()[:16]
+        return f"{hotel_id}_{hash_value}"
+
     def get_hotel_detail_url(self, hotel_id: str) -> str:
         """获取酒店详情页URL"""
         return self.DETAIL_URL_TEMPLATE.format(hotel_id=hotel_id)
@@ -261,8 +278,8 @@ class ReviewCrawler:
                 tags.extend(extract_tags(summary))
             tags = list(set(tags))
 
-            # 生成review_id（如果页面没有提供）
-            review_id = f"{hotel_id}_{hash(content)}"
+            # 生成review_id（使用MD5确保唯一性）
+            review_id = self._generate_review_id(hotel_id, content, user_nick)
 
             return {
                 'review_id': review_id,
