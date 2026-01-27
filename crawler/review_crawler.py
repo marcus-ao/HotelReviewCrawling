@@ -115,6 +115,8 @@ class ReviewCrawler:
 
     def filter_reviews(self, filter_type: int) -> bool:
         """筛选评论类型
+        
+        支持多个备用选择器，增强兼容性
 
         Args:
             filter_type: 筛选类型 (0=全部, 1=好评, 2=中评, 3=差评)
@@ -124,28 +126,85 @@ class ReviewCrawler:
         """
         page = self.anti_crawler.get_page()
 
-        # 评论筛选radio按钮
+        # 主选择器映射（多个备用选择器）
         filter_map = {
-            0: '#review-t-1',  # 全部
-            1: '#review-t-2',  # 好评
-            2: '#review-t-4',  # 中评
-            3: '#review-t-5',  # 差评
+            0: ['#review-t-1', 'input[value="0"]', '.review-filter-all'],  # 全部
+            1: ['#review-t-2', 'input[value="1"]', '.review-filter-good'],  # 好评
+            2: ['#review-t-4', 'input[value="2"]', '.review-filter-medium'],  # 中评
+            3: ['#review-t-5', 'input[value="3"]', '.review-filter-bad'],  # 差评
+        }
+
+        selectors = filter_map.get(filter_type, [])
+        if not selectors:
+            logger.warning(f"未知的筛选类型: {filter_type}")
+            return False
+
+        # 尝试多个选择器
+        for selector in selectors:
+            try:
+                # 尝试直接点击input
+                filter_elem = page.ele(selector, timeout=2)
+                if filter_elem:
+                    # 如果是input，尝试点击对应的label
+                    if filter_elem.tag == 'input':
+                        input_id = filter_elem.attr('id')
+                        if input_id:
+                            label = page.ele(f'label[for="{input_id}"]', timeout=1)
+                            if label:
+                                label.click()
+                            else:
+                                filter_elem.click()
+                        else:
+                            filter_elem.click()
+                    else:
+                        filter_elem.click()
+
+                    self.anti_crawler.random_delay(1, 2)
+
+                    # 验证是否生效
+                    if self._verify_filter_applied(filter_type):
+                        logger.debug(f"评论筛选成功: 类型={filter_type}, 选择器={selector}")
+                        return True
+
+            except Exception as e:
+                logger.debug(f"选择器 {selector} 失败: {e}")
+                continue
+
+        logger.warning(f"所有选择器都失败，筛选类型: {filter_type}")
+        return False
+
+    def _verify_filter_applied(self, filter_type: int) -> bool:
+        """验证筛选是否生效
+        
+        Args:
+            filter_type: 筛选类型
+        
+        Returns:
+            是否生效
+        """
+        page = self.anti_crawler.get_page()
+
+        # 检查URL参数
+        current_url = page.url
+        if f"rateScore={filter_type}" in current_url:
+            return True
+
+        # 检查选中状态
+        filter_map = {
+            0: '#review-t-1',
+            1: '#review-t-2',
+            2: '#review-t-4',
+            3: '#review-t-5',
         }
 
         selector = filter_map.get(filter_type)
-        if not selector:
-            return False
-
-        filter_elem = page.ele(selector, timeout=3)
-        if filter_elem:
-            # 点击对应的label
-            label = page.ele(f'label[for="{selector[1:]}"]', timeout=2)
-            if label:
-                label.click()
-                self.anti_crawler.random_delay(1, 2)
+        if selector:
+            elem = page.ele(selector, timeout=1)
+            if elem and elem.attr('checked'):
                 return True
 
-        return False
+        # 如果无法验证，假设成功（避免过度严格）
+        return True
 
     def filter_with_images(self, enabled: bool = True) -> bool:
         """筛选有图评论

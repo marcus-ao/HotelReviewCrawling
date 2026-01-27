@@ -313,7 +313,7 @@ class HotelListCrawler:
         return all_hotels
 
     def _save_hotels(self, hotels: list[dict]) -> int:
-        """保存酒店到数据库
+        """保存酒店到数据库（批量去重优化）
 
         Args:
             hotels: 酒店数据列表
@@ -321,39 +321,51 @@ class HotelListCrawler:
         Returns:
             成功保存的数量
         """
+        if not hotels:
+            return 0
+
         saved_count = 0
+        updated_count = 0
 
         with session_scope() as session:
+            # 批量查询已存在的酒店ID（减少数据库查询次数）
+            hotel_ids = [h['hotel_id'] for h in hotels if 'hotel_id' in h]
+            existing_hotels = session.query(Hotel).filter(
+                Hotel.hotel_id.in_(hotel_ids)
+            ).all()
+            
+            # 构建已存在酒店的字典，方便快速查找
+            existing_dict = {h.hotel_id: h for h in existing_hotels}
+            
+            logger.debug(f"批量查询: {len(hotel_ids)}个酒店ID, 已存在{len(existing_dict)}个")
+
             for hotel_data in hotels:
                 try:
                     # 验证数据
                     validated = HotelModel(**hotel_data)
 
-                    # 检查是否已存在
-                    existing = session.query(Hotel).filter_by(
-                        hotel_id=validated.hotel_id
-                    ).first()
-
-                    if existing:
+                    if validated.hotel_id in existing_dict:
                         # 更新现有记录
+                        existing = existing_dict[validated.hotel_id]
                         for key, value in validated.model_dump().items():
                             if value is not None:
                                 setattr(existing, key, value)
+                        updated_count += 1
                         logger.debug(f"更新酒店: {validated.name}")
                     else:
                         # 创建新记录
                         hotel = Hotel(**validated.model_dump())
                         session.add(hotel)
+                        saved_count += 1
                         logger.debug(f"新增酒店: {validated.name}")
-
-                    saved_count += 1
 
                 except Exception as e:
                     logger.warning(f"保存酒店失败: {e}")
                     continue
 
-        logger.info(f"保存完成: {saved_count}/{len(hotels)} 家酒店")
-        return saved_count
+        total = saved_count + updated_count
+        logger.info(f"保存完成: 新增{saved_count}家, 更新{updated_count}家, 共{total}家")
+        return total
 
     def get_hotels_for_review_crawl(self) -> Generator[Hotel, None, None]:
         """获取需要爬取评论的酒店

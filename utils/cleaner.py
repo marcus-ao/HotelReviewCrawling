@@ -111,27 +111,86 @@ def parse_star_score(style_width: str) -> float:
 
 def parse_date(date_str: str) -> Optional[str]:
     """解析日期字符串
+    
+    支持多种日期格式：
+    - 标准格式: "[2026-01-11 20:34]" 或 "2026-01-11 20:34"
+    - 相对时间: "2天前", "昨天", "今天", "刚刚"
+    - 其他格式: "2026/01/11", "2026.01.11"
 
     Args:
-        date_str: 日期字符串，如 "[2026-01-11 20:34]"
+        date_str: 日期字符串
 
     Returns:
         标准化日期字符串 "YYYY-MM-DD HH:MM:SS" 或 None
     """
     if not date_str:
         return None
-
-    # 去除方括号
-    date_str = date_str.strip('[]')
-
-    # 匹配日期时间格式
-    match = re.search(r'(\d{4}-\d{2}-\d{2})\s*(\d{2}:\d{2})?', date_str)
-    if match:
-        date_part = match.group(1)
-        time_part = match.group(2) or "00:00"
-        return f"{date_part} {time_part}:00"
-
-    return None
+    
+    try:
+        from datetime import datetime, timedelta
+        
+        # 去除方括号和首尾空白
+        date_str = date_str.strip('[]').strip()
+        
+        # 处理相对时间
+        if '天前' in date_str:
+            match = re.search(r'(\d+)天前', date_str)
+            if match:
+                days = int(match.group(1))
+                target_date = datetime.now() - timedelta(days=days)
+                return target_date.strftime("%Y-%m-%d %H:%M:%S")
+        
+        elif '小时前' in date_str:
+            match = re.search(r'(\d+)小时前', date_str)
+            if match:
+                hours = int(match.group(1))
+                target_date = datetime.now() - timedelta(hours=hours)
+                return target_date.strftime("%Y-%m-%d %H:%M:%S")
+        
+        elif '分钟前' in date_str:
+            match = re.search(r'(\d+)分钟前', date_str)
+            if match:
+                minutes = int(match.group(1))
+                target_date = datetime.now() - timedelta(minutes=minutes)
+                return target_date.strftime("%Y-%m-%d %H:%M:%S")
+        
+        elif '昨天' in date_str:
+            target_date = datetime.now() - timedelta(days=1)
+            # 尝试提取时间部分
+            time_match = re.search(r'(\d{2}:\d{2})', date_str)
+            if time_match:
+                time_str = time_match.group(1)
+                return f"{target_date.strftime('%Y-%m-%d')} {time_str}:00"
+            return target_date.strftime("%Y-%m-%d 00:00:00")
+        
+        elif '今天' in date_str or '刚刚' in date_str:
+            target_date = datetime.now()
+            # 尝试提取时间部分
+            time_match = re.search(r'(\d{2}:\d{2})', date_str)
+            if time_match:
+                time_str = time_match.group(1)
+                return f"{target_date.strftime('%Y-%m-%d')} {time_str}:00"
+            return target_date.strftime("%Y-%m-%d %H:%M:%S")
+        
+        # 匹配标准日期时间格式 (YYYY-MM-DD HH:MM 或 YYYY-MM-DD)
+        match = re.search(r'(\d{4}[-/\.]\d{2}[-/\.]\d{2})\s*(\d{2}:\d{2})?', date_str)
+        if match:
+            date_part = match.group(1).replace('/', '-').replace('.', '-')
+            time_part = match.group(2) or "00:00"
+            
+            # 验证日期有效性
+            try:
+                datetime.strptime(f"{date_part} {time_part}", "%Y-%m-%d %H:%M")
+                return f"{date_part} {time_part}:00"
+            except ValueError:
+                # 日期无效（如2月30日）
+                return None
+        
+        return None
+        
+    except (ValueError, AttributeError) as e:
+        # 日期解析失败，返回None
+        return None
 
 
 def extract_price(price_str: str) -> Optional[int]:
