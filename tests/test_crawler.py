@@ -185,7 +185,7 @@ class TestHotelListCrawler:
         )
 
         assert "city=440100" in url
-        assert "businessZone=39584" in url
+        assert "businessAreaId=39584" in url
         assert "priceRange=300-600" in url
 
 

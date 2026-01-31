@@ -4,11 +4,14 @@
     # 测试模式（验证配置和连接）
     python main.py --mode test
 
-    # 爬取酒店列表
+    # 爬取酒店列表（基本信息）
     python main.py --mode hotel_list --region "CBD商务区"
 
     # 爬取所有功能区的酒店列表
     python main.py --mode hotel_list --all
+
+    # 补充酒店详细信息（评分、价格等）
+    python main.py --mode enrich_details
 
     # 爬取评论
     python main.py --mode reviews --hotel-id 10019773
@@ -121,6 +124,29 @@ def crawl_hotel_list(region: str = None, all_regions: bool = False):
         anti_crawler.close()
 
 
+def enrich_hotel_details():
+    """补充酒店详细信息"""
+    logger.info("开始补充酒店详细信息")
+    
+    anti_crawler = AntiCrawler()
+    crawler = HotelListCrawler(anti_crawler)
+    
+    try:
+        anti_crawler.init_browser()
+        
+        # 补充所有缺少详细信息的酒店
+        enriched_count = crawler.enrich_hotel_details()
+        
+        logger.info(f"补充完成，成功更新 {enriched_count} 家酒店的详细信息")
+        
+    except KeyboardInterrupt:
+        logger.warning("用户中断补充")
+    except Exception as e:
+        logger.error(f"补充失败: {e}")
+    finally:
+        anti_crawler.close()
+
+
 def crawl_reviews(hotel_id: str = None, all_hotels: bool = False):
     """爬取评论
 
@@ -198,9 +224,9 @@ def main():
 
     parser.add_argument(
         "--mode",
-        choices=["test", "hotel_list", "reviews"],
+        choices=["test", "hotel_list", "enrich_details", "reviews"],
         required=True,
-        help="运行模式: test(测试), hotel_list(酒店列表), reviews(评论)"
+        help="运行模式: test(测试), hotel_list(酒店列表), enrich_details(补充详情), reviews(评论)"
     )
 
     parser.add_argument(
@@ -232,6 +258,9 @@ def main():
 
     elif args.mode == "hotel_list":
         crawl_hotel_list(region=args.region, all_regions=args.all)
+
+    elif args.mode == "enrich_details":
+        enrich_hotel_details()
 
     elif args.mode == "reviews":
         crawl_reviews(hotel_id=args.hotel_id, all_hotels=args.all)

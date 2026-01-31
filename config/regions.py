@@ -8,8 +8,8 @@
 PRICE_RANGES = [
     {"level": "经济型", "min": 0, "max": 300, "top_n": 4, "sort": "score"},
     {"level": "舒适型", "min": 300, "max": 600, "top_n": 6, "sort": "sales"},
-    {"level": "高档型", "min": 600, "max": 1200, "top_n": 3, "sort": "sales"},
-    {"level": "奢华型", "min": 1200, "max": 99999, "top_n": 2, "sort": "default"},
+    {"level": "高档型", "min": 600, "max": 1500, "top_n": 3, "sort": "sales"},
+    {"level": "奢华型", "min": 1500, "max": 99999, "top_n": 2, "sort": "default"},
 ]
 
 # 广州6大功能区配置

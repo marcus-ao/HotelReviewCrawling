@@ -29,7 +29,7 @@ class Settings(BaseSettings):
 
     # 评论采集配置
     max_reviews_per_hotel: int = Field(default=300, alias="MAX_REVIEWS_PER_HOTEL")
-    min_reviews_threshold: int = Field(default=50, alias="MIN_REVIEWS_THRESHOLD")
+    min_reviews_threshold: int = Field(default=200, alias="MIN_REVIEWS_THRESHOLD")
 
     # 日志配置
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
