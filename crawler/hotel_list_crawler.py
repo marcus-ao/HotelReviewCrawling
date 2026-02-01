@@ -39,7 +39,6 @@ class HotelListCrawler:
         business_zone_code: str = None,
         price_min: int = None,
         price_max: int = None,
-        sort_by: str = "default",
         check_in: str = None,
         check_out: str = None,
     ) -> str:
@@ -50,7 +49,6 @@ class HotelListCrawler:
             business_zone_code: 商圈代码
             price_min: 最低价格
             price_max: 最高价格
-            sort_by: 排序方式 (default/sales/score/price)
             check_in: 入住日期
             check_out: 离店日期
 
@@ -78,17 +76,6 @@ class HotelListCrawler:
             params.append(f"priceRange={price_min}-{price_max}")
             params.append(f"lowPrice={price_min}")
             params.append(f"highPrice={price_max}")
-
-        # 排序方式
-        sort_map = {
-            "default": "",
-            "sales": "sortType=1",
-            "score": "sortType=2",
-            "price": "sortType=3",
-        }
-        if sort_by in sort_map and sort_map[sort_by]:
-            params.append(sort_map[sort_by])
-
         url = f"{self.BASE_URL}?{'&'.join(params)}"
         return url
 
@@ -97,6 +84,8 @@ class HotelListCrawler:
         max_hotels: int = None,
         exclude_ids: Optional[set[str]] = None,
         min_review_count: Optional[int] = None,
+        sort_strategy: Optional[str] = None,
+        price_range: Optional[dict] = None,
     ) -> list[dict]:
         """从当前页面提取酒店信息（支持翻页）
 
@@ -109,13 +98,12 @@ class HotelListCrawler:
         """
         page = self.anti_crawler.get_page()
         all_hotels = []
-        region_seen_ids: set[str] = set()
         seen_hotel_ids = set()
         exclude_ids = set(exclude_ids) if exclude_ids else set()
         if min_review_count is None:
             min_review_count = settings.min_reviews_threshold
         current_page = 1
-        max_pages = 30  # max pages guard
+        max_pages = 50  # search deeper before fallback
         
         while True:
             # 等待页面完全加载
@@ -131,7 +119,6 @@ class HotelListCrawler:
             # 再等待一下确保数据加载完成
             time.sleep(3)
 
-            # 滚动页面以触发懒加载
             self.anti_crawler.scroll_to_bottom(step=500, max_scrolls=5)
             time.sleep(2)
 
@@ -140,6 +127,7 @@ class HotelListCrawler:
             page_info = self._get_query_page_info(html)
             page_no = current_page
             total_page = None
+
             if page_info:
                 try:
                     page_no = int(page_info.get("currentPage"))
@@ -150,6 +138,7 @@ class HotelListCrawler:
                 except Exception:
                     total_page = None
 
+
             logger.info(f"正在提取第 {page_no} 页...")
 
             # 统计本页新增的酒店数
@@ -158,6 +147,43 @@ class HotelListCrawler:
 
             hotels_on_page = self._extract_hotels_from_query_data(html)
             if hotels_on_page:
+                def _sort_key(item: dict) -> tuple:
+                    review_count = item.get("review_count") or 0
+                    try:
+                        review_count = int(review_count)
+                    except Exception:
+                        review_count = 0
+
+                    price = item.get("base_price")
+                    try:
+                        price = int(price) if price is not None else None
+                    except Exception:
+                        price = None
+
+                    score = item.get("rating_score")
+                    try:
+                        score = float(score) if score is not None else None
+                    except Exception:
+                        score = None
+
+                    if sort_strategy == "price_desc":
+                        price_key = -(price if price is not None else -1)
+                        score_key = -(score if score is not None else 0)
+                        return (-review_count, price_key, score_key)
+                    if sort_strategy in ("price", "price_asc"):
+                        price_key = price if price is not None else 10**9
+                        score_key = -(score if score is not None else 0)
+                        return (-review_count, price_key, score_key)
+                    if sort_strategy == "score":
+                        score_key = -(score if score is not None else 0)
+                        price_key = price if price is not None else 10**9
+                        return (-review_count, score_key, price_key)
+
+                    price_key = price if price is not None else 10**9
+                    score_key = -(score if score is not None else 0)
+                    return (-review_count, price_key, score_key)
+
+                hotels_on_page.sort(key=_sort_key)
                 logger.info(f"page {page_no}: {len(hotels_on_page)} hotels from query data")
 
                 for hotel_data in hotels_on_page:
@@ -169,10 +195,12 @@ class HotelListCrawler:
                         review_count = int(review_count)
                     except Exception:
                         review_count = 0
-                    if min_review_count and review_count < min_review_count:
+                    if min_review_count and review_count <= min_review_count:
                         skipped_low_review += 1
                         continue
                     if hotel_id in seen_hotel_ids or hotel_id in exclude_ids:
+                        continue
+                    if price_range and not self._price_in_range(hotel_data.get('base_price'), price_range):
                         continue
 
                     all_hotels.append(hotel_data)
@@ -194,6 +222,8 @@ class HotelListCrawler:
                     # 检查是否已经提取过
                     if hotel_id in seen_hotel_ids or hotel_id in exclude_ids:
                         continue
+                    if price_range and not self._price_in_range(hotel_data.get('base_price'), price_range):
+                        continue
 
                     try:
                         hotel_data = self._extract_hotel_from_html(html, hotel_id)
@@ -203,7 +233,7 @@ class HotelListCrawler:
                                 review_count = int(review_count)
                             except Exception:
                                 review_count = 0
-                            if min_review_count and review_count < min_review_count:
+                            if min_review_count and review_count <= min_review_count:
                                 skipped_low_review += 1
                                 continue
                             all_hotels.append(hotel_data)
@@ -224,12 +254,12 @@ class HotelListCrawler:
             
             # 检查是否需要翻页
             if total_page and page_no >= total_page:
-                logger.info("???????????")
+                logger.info("Reached last page, stop pagination")
                 break
 
 
             
-            if current_page >= max_pages:
+            if max_pages and current_page >= max_pages:
                 logger.info(f"已达到最大页数 {max_pages}，停止翻页")
                 break
             
@@ -281,6 +311,43 @@ class HotelListCrawler:
                         return html[brace_start:i + 1]
 
         return None
+
+    def _map_price_level(self, base_price: Optional[int]) -> Optional[str]:
+        """Map base price to configured price level."""
+        if base_price is None:
+            return None
+        try:
+            price = int(base_price)
+        except Exception:
+            return None
+
+        for pr in PRICE_RANGES:
+            min_price = pr.get("min")
+            max_price = pr.get("max")
+            if min_price is None or max_price is None:
+                continue
+
+            if price >= min_price and (price < max_price or max_price >= 99999):
+                return pr.get("level")
+        return None
+
+    def _price_in_range(self, base_price: Optional[int], price_range: dict) -> bool:
+        """Check if base price falls into the given range."""
+        if base_price is None:
+            return False
+        try:
+            price = int(base_price)
+        except Exception:
+            return False
+
+        min_price = price_range.get("min")
+        max_price = price_range.get("max")
+        if min_price is None or max_price is None:
+            return False
+
+        if max_price >= 99999:
+            return price >= min_price
+        return min_price <= price < max_price
 
     def _extract_hotels_from_query_data(self, html: str) -> list[dict]:
         """Extract hotel list from __QUERY_RESULT_DATA__ JSON in the page."""
@@ -516,8 +583,10 @@ class HotelListCrawler:
             return None
 
 
+
+
     def _go_to_next_page(self, page_info: Optional[dict] = None) -> bool:
-        """????????URL?????????"""
+        """Go to next page (URL-first, click as fallback)."""
         page = self.anti_crawler.get_page()
 
         if page_info is None:
@@ -544,7 +613,7 @@ class HotelListCrawler:
         if current_page:
             next_page = current_page + 1
             if total_page and next_page > total_page:
-                logger.debug("??????")
+                logger.debug("Reached last page")
                 return False
 
             current_url = getattr(page, "url", "") or ""
@@ -561,7 +630,7 @@ class HotelListCrawler:
                     if url in seen or url == current_url:
                         continue
                     seen.add(url)
-                    logger.debug(f"????URL: {url}")
+                    logger.debug(f"Try page URL: {url}")
                     if not self.anti_crawler.navigate_to(url):
                         continue
                     time.sleep(2)
@@ -577,53 +646,44 @@ class HotelListCrawler:
         return self._go_to_next_page_by_click()
 
     def _go_to_next_page_by_click(self) -> bool:
-        """?????????"""
+        """Fallback: click next page button."""
         page = self.anti_crawler.get_page()
 
         try:
-            # ??"???"??
-            # ???????????????
             next_button_selectors = [
-                'a.page-next',           # ?????
-                '.pagination .next',     # ????????
-                'a[title="???"]',     # ?title????
-                '.page-link.next',       # Bootstrap??
-                'li.next a',             # ????????
+                'a.page-next',           # next link
+                '.pagination .next',     # pagination next
+                'a[title="Next"]',      # title next
+                '.page-link.next',       # Bootstrap style
+                'li.next a',             # list item next
             ]
 
             next_button = None
             for selector in next_button_selectors:
                 next_button = page.ele(selector, timeout=2)
                 if next_button:
-                    logger.debug(f"???????: {selector}")
+                    logger.debug(f"Found next button: {selector}")
                     break
 
             if not next_button:
-                logger.debug("????????")
+                logger.debug("Next button not found")
                 return False
 
-            # ????????????disabled???
             if next_button.attr('class') and 'disabled' in next_button.attr('class'):
-                logger.debug("????????")
+                logger.debug("Next button disabled")
                 return False
 
-            # ???????
             next_button.scroll.to_see()
             time.sleep(0.5)
 
-            # ?????
-            logger.info("???????...")
+            logger.info("Click next page...")
             next_button.click()
 
-            # ??????
             time.sleep(2)
-
-            # ??URL?????????????
-            # ????????????????????
             return True
 
         except Exception as e:
-            logger.debug(f"????: {e}")
+            logger.debug(f"Pagination failed: {e}")
             return False
 
     def fetch_hotel_details(self, hotel_id: str) -> Optional[dict]:
@@ -803,7 +863,6 @@ class HotelListCrawler:
         zone_code = business_zone['code']
         price_level = price_range['level']
         top_n = target_count if target_count is not None else price_range['top_n']
-        sort_by = price_range.get('sort', 'default')
 
         logger.info(f"开始爬取: {region_type} - {zone_name} - {price_level} (目标: {top_n}家)")
 
@@ -812,7 +871,6 @@ class HotelListCrawler:
             business_zone_code=zone_code,
             price_min=price_range['min'],
             price_max=price_range['max'],
-            sort_by=sort_by,
         )
 
         # 导航到页面
@@ -824,20 +882,43 @@ class HotelListCrawler:
         logger.info("等待页面完全加载...")
         self.anti_crawler.random_delay(5, 8)
 
+
+
         # 提取酒店（支持翻页，直到达到目标数量）
         hotels = self.extract_hotels_from_page(
             max_hotels=top_n,
             exclude_ids=exclude_ids,
             min_review_count=settings.min_reviews_threshold,
+            price_range=price_range,
         )
 
-        # 添加分层信息
+        # 按起步价校验所属档次，确保价格区间与档次一致
+        filtered_hotels = []
+        skipped_no_price = 0
+        skipped_price_mismatch = 0
         for hotel in hotels:
+            base_price = hotel.get('base_price')
+            mapped_level = self._map_price_level(base_price)
+            if mapped_level is None:
+                skipped_no_price += 1
+                continue
+            if not self._price_in_range(base_price, price_range):
+                skipped_price_mismatch += 1
+                continue
+
             hotel['region_type'] = region_type
             hotel['business_zone'] = zone_name
             hotel['business_zone_code'] = zone_code
-            hotel['price_level'] = price_level
+            hotel['price_level'] = mapped_level
             hotel['city_code'] = '440100'
+            filtered_hotels.append(hotel)
+
+        if skipped_no_price or skipped_price_mismatch:
+            logger.info(
+                f"{zone_name} - {price_level} 过滤: "
+                f"无价格{skipped_no_price}家, 价格不匹配{skipped_price_mismatch}家"
+            )
+        hotels = filtered_hotels
 
         logger.info(f"爬取完成: {len(hotels)}/{top_n} 家酒店")
 
@@ -954,9 +1035,12 @@ class HotelListCrawler:
             logger.warning(
                 f"{zone_name} 仍缺少 {remaining} 家酒店，开始反向补位"
             )
-            for price_range in reversed(price_ranges):
+            for idx, price_range in enumerate(reversed(price_ranges)):
                 if remaining <= 0:
                     break
+                # Skip highest tier in reverse fill (already attempted)
+                if idx == 0:
+                    continue
 
                 target = remaining
                 logger.info(
@@ -1039,7 +1123,7 @@ class HotelListCrawler:
                     review_count = int(review_count)
                 except Exception:
                     review_count = 0
-                if review_count < min_review_count:
+                if review_count <= min_review_count:
                     skipped_low_review += 1
                     continue
                 filtered_hotels.append(hotel)
@@ -1047,7 +1131,7 @@ class HotelListCrawler:
 
         if not hotels:
             if skipped_low_review:
-                logger.info(f"????????: {skipped_low_review} ?")
+                logger.info(f"低评论酒店已过滤: {skipped_low_review} 家")
             return 0
 
         saved_count = 0
@@ -1105,6 +1189,10 @@ class HotelListCrawler:
                         self.anti_crawler.random_delay(2, 4)
                     
                     # 验证数据
+                    mapped_level = self._map_price_level(hotel_data.get('base_price'))
+                    if mapped_level:
+                        hotel_data['price_level'] = mapped_level
+
                     validated = HotelModel(**hotel_data)
 
                     # 检查是否存在该酒店ID的任何记录
@@ -1120,6 +1208,9 @@ class HotelListCrawler:
                             value = validated.model_dump().get(field)
                             if value is not None:
                                 setattr(first_existing, field, value)
+
+                        if mapped_level:
+                            first_existing.price_level = mapped_level
                         
                         updated_count += 1
                         logger.debug(f"更新酒店基本信息: {validated.name}")
@@ -1210,3 +1301,4 @@ class HotelListCrawler:
 
             for hotel in hotels:
                 yield hotel
+
