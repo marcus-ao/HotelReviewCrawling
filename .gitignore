@@ -38,6 +38,7 @@ venv*
 *.swp
 *.swo
 *~
+.sisyphus/
 
 # Logs
 logs/*.log
