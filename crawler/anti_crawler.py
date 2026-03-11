@@ -5,12 +5,17 @@
 """
 import random
 import time
-from typing import Optional
-
-from DrissionPage import ChromiumPage, ChromiumOptions
+from importlib import import_module
+from typing import Any, Optional
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from config.settings import settings
+from crawler.exceptions import (
+    CaptchaAutoSlideFailed,
+    CaptchaCooldownException,
+    CaptchaException,
+    CaptchaTimeoutException,
+)
 from utils.logger import get_logger
 
 logger = get_logger("anti_crawler")
@@ -20,10 +25,12 @@ class AntiCrawler:
     """反爬虫策略类"""
 
     def __init__(self):
-        self.page: Optional[ChromiumPage] = None
+        self.page: Optional[Any] = None
         self.is_connected = False
+        self._captcha_retry_count = 0
+        self._captcha_refresh_count = 0
 
-    def init_browser(self) -> ChromiumPage:
+    def init_browser(self) -> Any:
         """初始化浏览器（接管已打开的Chrome）
 
         需要先手动启动Chrome:
@@ -34,7 +41,9 @@ class AntiCrawler:
         """
         try:
             # 连接到已打开的Chrome浏览器
-            self.page = ChromiumPage(addr_or_opts=settings.chrome_address)
+            drission_page = import_module("DrissionPage")
+            chromium_page_cls = getattr(drission_page, "ChromiumPage")
+            self.page = chromium_page_cls(addr_or_opts=settings.chrome_address)
             self.is_connected = True
             logger.info(f"成功连接到Chrome浏览器: {settings.chrome_address}")
             return self.page
@@ -45,13 +54,13 @@ class AntiCrawler:
                        f'--user-data-dir="{settings.chrome_user_data_dir}"')
             raise
 
-    def get_page(self) -> ChromiumPage:
+    def get_page(self) -> Any:
         """获取页面实例"""
         if not self.page or not self.is_connected:
             return self.init_browser()
         return self.page
 
-    def random_delay(self, min_delay: float = None, max_delay: float = None) -> None:
+    def random_delay(self, min_delay: Optional[float] = None, max_delay: Optional[float] = None) -> None:
         """随机延迟，模拟人类行为
 
         Args:
@@ -88,43 +97,136 @@ class AntiCrawler:
 
         return False
 
-    def handle_captcha(self, auto_retry: bool = True) -> bool:
+    def _reset_captcha_counters(self) -> None:
+        """重置验证码重试计数器。"""
+        self._captcha_retry_count = 0
+        self._captcha_refresh_count = 0
+
+    def _raise_captcha_failure(self, exc: CaptchaException, reason: str) -> None:
+        """根据重试上限抛出可重试异常或冷却异常。"""
+        self._captcha_retry_count = exc.retry_count
+        if exc.should_retry():
+            raise exc
+
+        raise CaptchaCooldownException(
+            cooldown_seconds=settings.captcha_cooldown_seconds,
+            reason=reason,
+        )
+
+    def _is_verification_expired(self, attempts_since_refresh: int) -> bool:
+        """检查验证页是否过期或卡死。"""
+        page = self.get_page()
+
+        expiry_keywords = [
+            "验证已过期",
+            "验证失效",
+            "请刷新",
+            "页面已失效",
+            "重新验证",
+            "点击刷新",
+        ]
+
+        try:
+            html = page.html or ""
+            if any(keyword in html for keyword in expiry_keywords):
+                return True
+        except Exception:
+            logger.debug("读取验证页内容失败，跳过关键字检测")
+
+        # 启发式判断：同一页面多次自动滑块失败，且验证码仍在。
+        return attempts_since_refresh >= 2 and self.check_captcha()
+
+    def _refresh_verification_page(self) -> None:
+        """刷新验证页以恢复过期状态。"""
+        page = self.get_page()
+        page.refresh()
+        page.wait.load_start()
+        self.random_delay(1, 2)
+
+    def handle_captcha(self, auto_retry: bool = True) -> None:
         """处理验证码
 
         Args:
             auto_retry: 是否自动重试滑块
 
-        Returns:
-            是否成功处理
+        Raises:
+            CaptchaAutoSlideFailed: 自动滑块失败（可重试）
+            CaptchaTimeoutException: 验证码处理超时或验证页过期（可重试）
+            CaptchaCooldownException: 达到最大重试次数后进入冷却（终止）
         """
         if not self.check_captcha():
-            return True
+            self._reset_captcha_counters()
+            return
 
-        page = self.get_page()
+        if not auto_retry:
+            next_retry_count = self._captcha_retry_count + 1
+            self._raise_captcha_failure(
+                CaptchaAutoSlideFailed(
+                    reason="检测到验证码且自动重试已关闭",
+                    retry_count=next_retry_count,
+                    max_retries=settings.captcha_max_retries,
+                ),
+                reason="验证码自动处理被禁用，进入冷却",
+            )
 
-        if auto_retry:
-            # 尝试自动滑动
+        start_time = time.time()
+        attempts_since_refresh = 0
+
+        while self.check_captcha():
+            elapsed_seconds = int(time.time() - start_time)
+            if elapsed_seconds >= settings.captcha_solve_timeout_seconds:
+                next_retry_count = self._captcha_retry_count + 1
+                self._raise_captcha_failure(
+                    CaptchaTimeoutException(
+                        timeout_seconds=settings.captcha_solve_timeout_seconds,
+                        elapsed_seconds=elapsed_seconds,
+                        retry_count=next_retry_count,
+                        max_retries=settings.captcha_max_retries,
+                    ),
+                    reason="验证码处理超时，进入冷却",
+                )
+
             success = self._auto_slide_captcha()
             if success:
-                logger.info("自动滑块验证成功")
-                return True
+                self.random_delay(0.8, 1.5)
+                if not self.check_captcha():
+                    logger.info("自动滑块验证成功")
+                    self._reset_captcha_counters()
+                    return
 
-        # 自动处理失败，等待人工介入
-        logger.warning("=" * 50)
-        logger.warning("需要人工处理验证码！")
-        logger.warning("请在浏览器中手动完成验证，然后按Enter继续...")
-        logger.warning("=" * 50)
+            attempts_since_refresh += 1
 
-        input("按Enter键继续...")
+            if self._is_verification_expired(attempts_since_refresh):
+                if self._captcha_refresh_count < settings.captcha_refresh_retry_limit:
+                    self._captcha_refresh_count += 1
+                    attempts_since_refresh = 0
+                    logger.warning(
+                        f"验证页面疑似过期，执行刷新重试 "
+                        f"({self._captcha_refresh_count}/{settings.captcha_refresh_retry_limit})"
+                    )
+                    self._refresh_verification_page()
+                    continue
 
-        # 验证是否成功
-        self.random_delay(1, 2)
-        if not self.check_captcha():
-            logger.info("人工验证成功")
-            return True
+                next_retry_count = self._captcha_retry_count + 1
+                self._raise_captcha_failure(
+                    CaptchaTimeoutException(
+                        timeout_seconds=settings.captcha_solve_timeout_seconds,
+                        elapsed_seconds=elapsed_seconds,
+                        retry_count=next_retry_count,
+                        max_retries=settings.captcha_max_retries,
+                    ),
+                    reason="验证页面持续过期，超过刷新上限后进入冷却",
+                )
 
-        logger.error("验证码处理失败")
-        return False
+            next_retry_count = self._captcha_retry_count + 1
+            self._raise_captcha_failure(
+                CaptchaAutoSlideFailed(
+                    reason="自动滑块未通过验证",
+                    retry_count=next_retry_count,
+                    max_retries=settings.captcha_max_retries,
+                ),
+                reason="自动滑块多次失败，进入冷却",
+            )
 
     def _auto_slide_captcha(self) -> bool:
         """自动滑动滑块验证码
@@ -154,40 +256,59 @@ class AntiCrawler:
                 return False
 
             # 计算滑动距离
-            track_width = track.rect.get('width', 300)
+            track_width = int(track.rect.get('width', 300))
+            if track_width <= 0:
+                logger.debug("滑块轨道宽度异常")
+                return False
 
-            # 模拟人类滑动：先快后慢，带有轻微抖动
+            target_distance = max(track_width - int(round(random.uniform(6, 14))), 50)
+
+            def ease_in_out(progress: float) -> float:
+                # 三次平滑曲线：慢起步 -> 中段快 -> 末段减速
+                return 3 * progress * progress - 2 * progress * progress * progress
+
+            # 三段式 S 曲线：起步慢 -> 中段加速并超冲 -> 末段回拉修正
+            overshoot = 5 + int(round(random.uniform(0, 5)))
+            accelerate_target = int(round(ease_in_out(0.35) * target_distance))
+            overshoot_target = target_distance + overshoot
+
+            jitter_1 = int(round(random.uniform(-2, 2)))
+            jitter_2 = int(round(random.uniform(-2, 2)))
+            jitter_3 = int(round(random.uniform(-2, 2)))
+
+            step_1 = max(1, accelerate_target + jitter_1)
+            step_2 = max(1, overshoot_target - step_1 + jitter_2)
+            step_3 = target_distance - (step_1 + step_2) + jitter_3
+
+            # 对齐最终位移，确保轨迹可控
+            total_distance = step_1 + step_2 + step_3
+            if total_distance != target_distance:
+                step_3 += target_distance - total_distance
+
+            trajectory = [
+                (step_1, int(round(random.uniform(-2, 2))), random.uniform(0.05, 0.12)),
+                (step_2, int(round(random.uniform(-2, 2))), random.uniform(0.08, 0.2)),
+                (step_3, int(round(random.uniform(-2, 2))), random.uniform(0.05, 0.15)),
+            ]
+
+            # 模拟人类滑动：加速度变化 + 抖动 + 非恒定停顿 + 超冲回拉
             slider.hover()
-            time.sleep(0.3)
+            time.sleep(random.uniform(0.15, 0.35))
 
             # 按住滑块
             page.actions.hold(slider)
-            time.sleep(0.2)
+            time.sleep(random.uniform(0.12, 0.24))
 
-            # 分段滑动
-            current_x = 0
-            while current_x < track_width:
-                # 随机步长
-                step = random.randint(20, 50)
-                if current_x + step > track_width:
-                    step = track_width - current_x
-
-                # 添加轻微的Y轴抖动
-                y_offset = random.randint(-2, 2)
-
-                page.actions.move(step, y_offset, duration=random.uniform(0.05, 0.15))
-                current_x += step
-
-                # 随机暂停
-                if random.random() < 0.3:
-                    time.sleep(random.uniform(0.05, 0.1))
+            for offset_x, offset_y, pause_seconds in trajectory:
+                page.actions.move(offset_x, offset_y, duration=random.uniform(0.04, 0.16))
+                time.sleep(pause_seconds)
 
             # 释放滑块
-            time.sleep(0.1)
+            time.sleep(random.uniform(0.08, 0.16))
             page.actions.release()
 
             # 等待验证结果
-            time.sleep(2)
+            time.sleep(random.uniform(1.0, 1.8))
 
             # 检查是否成功
             success_indicators = ['.nc_ok', '.nc-success']
@@ -226,6 +347,10 @@ class AntiCrawler:
                 self.handle_captcha()
 
             return True
+
+        except (CaptchaException, CaptchaCooldownException):
+            logger.error("导航期间验证码处理失败")
+            raise
 
         except Exception as e:
             logger.error(f"导航失败: {e}")
