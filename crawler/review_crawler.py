@@ -550,7 +550,12 @@ class ReviewCrawler:
 
         return pages_loaded
 
-    def waterfall_crawl(self, hotel_id: str, max_reviews: Optional[int] = None) -> list[dict]:
+    def waterfall_crawl(
+        self,
+        hotel_id: str,
+        max_reviews: Optional[int] = None,
+        save_to_db: bool = True,
+    ) -> list[dict]:
         """瀑布流采集策略
 
         按优先级依次爬取：
@@ -567,6 +572,7 @@ class ReviewCrawler:
         """
         max_reviews = max_reviews or settings.max_reviews_per_hotel
         all_reviews = []
+        total_saved = 0
         self.crawled_review_ids.clear()
 
         logger.info(f"开始瀑布流采集酒店 {hotel_id}，目标 {max_reviews} 条")
@@ -584,31 +590,65 @@ class ReviewCrawler:
             logger.info(f"酒店 {hotel_id} 评论数 {total_count} 低于阈值，跳过")
             return []
 
+        def _crawl_and_checkpoint_pool(
+            source_pool: str,
+            filter_types: list[int],
+            max_count: int,
+            with_images: bool = False,
+        ) -> int:
+            nonlocal total_saved
+            logger.info(f"开始爬取评论池: {source_pool}, 目标 {max_count} 条")
+            pool_reviews = self._crawl_pool(
+                hotel_id=hotel_id,
+                source_pool=source_pool,
+                filter_types=filter_types,
+                with_images=with_images,
+                max_count=max_count,
+            )
+            all_reviews.extend(pool_reviews)
+
+            saved_count = 0
+            if save_to_db and pool_reviews:
+                saved_count = self.save_reviews(pool_reviews)
+                total_saved += saved_count
+
+            logger.info(
+                f"评论池完成: pool={source_pool}, crawled={len(pool_reviews)}, "
+                f"saved={saved_count if save_to_db else 0}, total_collected={len(all_reviews)}"
+            )
+            return len(pool_reviews)
+
         # 步骤1: 负面警示池（差评+中评）
         logger.info("步骤1: 爬取负面警示池")
-        negative_reviews = self._crawl_pool(
-            hotel_id=hotel_id,
-            source_pool="negative",
-            filter_types=[self.FILTER_BAD, self.FILTER_MEDIUM],
-            max_count=100,
-        )
-        all_reviews.extend(negative_reviews)
-        logger.info(f"负面警示池: {len(negative_reviews)} 条")
+        try:
+            _crawl_and_checkpoint_pool(
+                source_pool="negative",
+                filter_types=[self.FILTER_BAD, self.FILTER_MEDIUM],
+                max_count=100,
+            )
+        except (CaptchaException, CaptchaCooldownException) as exc:
+            logger.warning(
+                f"评论池中断: pool=negative, 已采集={len(all_reviews)}, 已保存={total_saved}, error={exc}"
+            )
+            raise
 
         if len(all_reviews) >= max_reviews:
             return all_reviews[:max_reviews]
 
         # 步骤2: 高质量证据池（有图评论）
         logger.info("步骤2: 爬取高质量证据池")
-        evidence_reviews = self._crawl_pool(
-            hotel_id=hotel_id,
-            source_pool="evidence",
-            filter_types=[self.FILTER_ALL],
-            with_images=True,
-            max_count=150,
-        )
-        all_reviews.extend(evidence_reviews)
-        logger.info(f"高质量证据池: {len(evidence_reviews)} 条")
+        try:
+            _crawl_and_checkpoint_pool(
+                source_pool="evidence",
+                filter_types=[self.FILTER_ALL],
+                with_images=True,
+                max_count=150,
+            )
+        except (CaptchaException, CaptchaCooldownException) as exc:
+            logger.warning(
+                f"评论池中断: pool=evidence, 已采集={len(all_reviews)}, 已保存={total_saved}, error={exc}"
+            )
+            raise
 
         if len(all_reviews) >= max_reviews:
             return all_reviews[:max_reviews]
@@ -616,14 +656,17 @@ class ReviewCrawler:
         # 步骤3: 时效性补全池（最新评论）
         remaining = max_reviews - len(all_reviews)
         logger.info(f"步骤3: 爬取时效性补全池，剩余配额 {remaining}")
-        latest_reviews = self._crawl_pool(
-            hotel_id=hotel_id,
-            source_pool="latest",
-            filter_types=[self.FILTER_ALL],
-            max_count=remaining,
-        )
-        all_reviews.extend(latest_reviews)
-        logger.info(f"时效性补全池: {len(latest_reviews)} 条")
+        try:
+            _crawl_and_checkpoint_pool(
+                source_pool="latest",
+                filter_types=[self.FILTER_ALL],
+                max_count=remaining,
+            )
+        except (CaptchaException, CaptchaCooldownException) as exc:
+            logger.warning(
+                f"评论池中断: pool=latest, 已采集={len(all_reviews)}, 已保存={total_saved}, error={exc}"
+            )
+            raise
 
         logger.info(f"酒店 {hotel_id} 采集完成，共 {len(all_reviews)} 条评论")
         return all_reviews
@@ -718,14 +761,15 @@ class ReviewCrawler:
         with session_scope() as session:
             for review_data in reviews:
                 try:
-                    # 提取图片和回复数据
-                    image_urls = review_data.pop('image_urls', [])
-                    reply_content = review_data.pop('reply_content', None)
-                    reply_date = review_data.pop('reply_date', None)
-                    review_data.pop('has_reply', None)
+                    # 提取图片和回复数据（使用副本，避免修改原始评论字典）
+                    review_payload = dict(review_data)
+                    image_urls = review_payload.pop('image_urls', [])
+                    reply_content = review_payload.pop('reply_content', None)
+                    reply_date = review_payload.pop('reply_date', None)
+                    review_payload.pop('has_reply', None)
 
                     # 验证数据
-                    validated = ReviewModel(**review_data)
+                    validated = ReviewModel(**review_payload)
 
                     # 检查是否已存在
                     existing = session.query(Review).filter_by(
@@ -778,9 +822,9 @@ class ReviewCrawler:
         Returns:
             评论列表
         """
-        reviews = self.waterfall_crawl(hotel_id)
+        reviews = self.waterfall_crawl(hotel_id, save_to_db=save_to_db)
 
-        if save_to_db and reviews:
-            self.save_reviews(reviews)
+        if save_to_db:
+            logger.info(f"酒店 {hotel_id} 评论采集已在分池阶段完成保存")
 
         return reviews
