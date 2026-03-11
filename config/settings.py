@@ -31,6 +31,11 @@ class Settings(BaseSettings):
     max_reviews_per_hotel: int = Field(default=300, alias="MAX_REVIEWS_PER_HOTEL")
     min_reviews_threshold: int = Field(default=200, alias="MIN_REVIEWS_THRESHOLD")
 
+    # 验证码配置
+    captcha_max_retries: int = Field(default=3, alias="CAPTCHA_MAX_RETRIES")
+    captcha_cooldown_seconds: int = Field(default=180, alias="CAPTCHA_COOLDOWN_SECONDS")
+    captcha_solve_timeout_seconds: int = Field(default=120, alias="CAPTCHA_SOLVE_TIMEOUT_SECONDS")
+    captcha_refresh_retry_limit: int = Field(default=2, alias="CAPTCHA_REFRESH_RETRY_LIMIT")
     # 日志配置
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
     log_dir: str = Field(default="logs", alias="LOG_DIR")
