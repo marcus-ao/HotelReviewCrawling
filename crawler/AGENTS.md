@@ -172,37 +172,37 @@ main.py
 3. **CSS选择器脆弱** — 飞猪改版会导致 `.tb-r-comment`, `.tb-r-cnt`, `.starscore` 等批量失效
 4. **hotel_list_crawler.py 过大** — 1304行单文件，建议拆分: 提取逻辑/翻页逻辑/入库逻辑/弹性补位
 
-## CAPTCHA AUTOMATION
+## 验证码自动化
 
-### Configuration (config/settings.py)
-- `CAPTCHA_MAX_RETRIES = 3`: Maximum retry attempts
-- `CAPTCHA_TIMEOUT = 120`: Verification timeout in seconds
-- `CAPTCHA_COOLDOWN = 180`: Cooldown period after max retries
-- `CAPTCHA_REFRESH_RETRY_LIMIT = 2`: Max verification page refreshes
+### 配置参数 (config/settings.py)
+- `CAPTCHA_MAX_RETRIES = 3`: 最大重试次数
+- `CAPTCHA_TIMEOUT = 120`: 验证超时时间（秒）
+- `CAPTCHA_COOLDOWN = 180`: 达到重试上限后的冷却时间（秒）
+- `CAPTCHA_REFRESH_RETRY_LIMIT = 2`: 验证页刷新次数上限
 
-### Exception Hierarchy (crawler/exceptions.py)
-- `CrawlerException`: Base exception
-  - `CaptchaException`: Retryable captcha failure (should_retry() = True)
-  - `CaptchaCooldownException`: Terminal cooldown (should_retry() = False)
+### 异常层次结构 (crawler/exceptions.py)
+- `CrawlerException`: 基础异常类
+  - `CaptchaException`: 可重试的验证码失败 (should_retry() = True)
+  - `CaptchaCooldownException`: 终止冷却 (should_retry() = False)
 
-### Automated Flow
-1. Navigate to page → check_captcha()
-2. If captcha detected → handle_captcha()
-3. Attempt auto_slide_captcha() with human-like trajectory
-4. If verification page expired → refresh_verification_page()
-5. Retry up to CAPTCHA_MAX_RETRIES times
-6. If max retries exhausted → raise CaptchaCooldownException
-7. CLI/scheduler catch cooldown exception → stop task, log cooldown message
+### 自动化流程
+1. 导航到页面 → check_captcha()
+2. 检测到验证码 → handle_captcha()
+3. 尝试 auto_slide_captcha() 使用人类化轨迹
+4. 验证页过期 → refresh_verification_page()
+5. 重试最多 CAPTCHA_MAX_RETRIES 次
+6. 达到最大重试次数 → 抛出 CaptchaCooldownException
+7. CLI/调度器捕获冷却异常 → 停止任务，记录冷却消息
 
-### Recovery Behavior
-- Hotel list: Per-page incremental save, resume from next page
-- Reviews: Per-pool checkpoint save, completed pools survive interruption
-- Task state preserved for later retry after cooldown period
+### 恢复行为
+- 酒店列表: 每页增量保存，从下一页恢复
+- 评论采集: 每池检查点保存，已完成的池在中断时保留
+- 任务状态保留以便冷却期后重试
 
-### Test Coverage (tests/)
-- `test_anti_crawler_captcha.py`: 7 captcha engine tests
-- `test_captcha_recovery.py`: 6 recovery/interruption tests
-- All 32 tests passing
+### 测试覆盖 (tests/)
+- `test_anti_crawler_captcha.py`: 7个验证码引擎测试
+- `test_captcha_recovery.py`: 6个恢复/中断测试
+- 全部32个测试通过
 
 ## WHERE TO LOOK (CRAWLER-SPECIFIC)
 
