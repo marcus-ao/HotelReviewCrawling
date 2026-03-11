@@ -3,7 +3,7 @@ import json
 import re
 import time
 from urllib.parse import urlsplit, urlunsplit, parse_qs, urlencode
-from typing import Optional, Generator
+from typing import Callable, Optional, Generator
 from datetime import datetime, timedelta
 
 from config.settings import settings
@@ -14,6 +14,7 @@ from utils.validator import HotelModel
 from database.connection import session_scope
 from database.models import Hotel, CrawlTask
 from .anti_crawler import AntiCrawler
+from .exceptions import CaptchaCooldownException, CaptchaException
 
 logger = get_logger("hotel_list_crawler")
 
@@ -24,7 +25,7 @@ class HotelListCrawler:
     # 飞猪酒店列表URL模板
     BASE_URL = "https://hotel.fliggy.com/hotel_list3.htm"
 
-    def __init__(self, anti_crawler: AntiCrawler = None):
+    def __init__(self, anti_crawler: Optional[AntiCrawler] = None):
         """初始化爬虫
 
         Args:
@@ -32,15 +33,16 @@ class HotelListCrawler:
         """
         self.anti_crawler = anti_crawler or AntiCrawler()
         self.page = None
+        self._position_context: dict[str, object] = {}
 
     def build_search_url(
         self,
         city_code: str = "440100",
-        business_zone_code: str = None,
-        price_min: int = None,
-        price_max: int = None,
-        check_in: str = None,
-        check_out: str = None,
+        business_zone_code: Optional[str] = None,
+        price_min: Optional[int] = None,
+        price_max: Optional[int] = None,
+        check_in: Optional[str] = None,
+        check_out: Optional[str] = None,
     ) -> str:
         """构建搜索URL
 
@@ -79,13 +81,102 @@ class HotelListCrawler:
         url = f"{self.BASE_URL}?{'&'.join(params)}"
         return url
 
+    def _update_position_context(self, **kwargs) -> None:
+        """Update crawl position context for logging/resume hints."""
+        for key, value in kwargs.items():
+            if value is None:
+                self._position_context.pop(key, None)
+            else:
+                self._position_context[key] = value
+
+    def _clear_position_context(self) -> None:
+        """Clear crawl position context."""
+        self._position_context.clear()
+
+    def _format_position_context(self) -> str:
+        """Format crawl position context for logs."""
+        ordered_keys = [
+            "region_type",
+            "business_zone",
+            "business_zone_code",
+            "price_level",
+            "target_count",
+            "saved_count",
+            "current_page",
+            "current_url",
+        ]
+        parts = []
+        for key in ordered_keys:
+            value = self._position_context.get(key)
+            if value is not None:
+                parts.append(f"{key}={value}")
+        return ", ".join(parts) if parts else "context=unknown"
+
+    def _log_captcha_failure(self, action: str, exc: Exception) -> None:
+        """Log captcha failure with current crawl context."""
+        logger.error(f"{action} 遇到验证码失败: {exc} | {self._format_position_context()}")
+
+    def _get_saved_hotel_ids(
+        self,
+        region_type: str,
+        business_zone_code: str,
+        price_level: str,
+    ) -> set[str]:
+        """Load already saved hotel ids for resume-safe crawling."""
+        with session_scope() as session:
+            rows = session.query(Hotel.hotel_id).filter(
+                Hotel.region_type == region_type,
+                Hotel.business_zone_code == business_zone_code,
+                Hotel.price_level == price_level,
+            ).all()
+        return {hotel_id for hotel_id, in rows if hotel_id}
+
+    def _prepare_hotels_for_price_range(
+        self,
+        hotels: list[dict],
+        region_type: str,
+        zone_name: str,
+        zone_code: str,
+        price_range: dict,
+    ) -> list[dict]:
+        """Attach zone metadata and filter invalid price-range records."""
+        prepared_hotels = []
+        skipped_no_price = 0
+        skipped_price_mismatch = 0
+
+        for hotel in hotels:
+            base_price = hotel.get('base_price')
+            mapped_level = self._map_price_level(base_price)
+            if mapped_level is None:
+                skipped_no_price += 1
+                continue
+            if not self._price_in_range(base_price, price_range):
+                skipped_price_mismatch += 1
+                continue
+
+            hotel['region_type'] = region_type
+            hotel['business_zone'] = zone_name
+            hotel['business_zone_code'] = zone_code
+            hotel['price_level'] = mapped_level
+            hotel['city_code'] = '440100'
+            prepared_hotels.append(hotel)
+
+        if skipped_no_price or skipped_price_mismatch:
+            logger.info(
+                f"{zone_name} - {price_range['level']} 过滤: "
+                f"无价格{skipped_no_price}家, 价格不匹配{skipped_price_mismatch}家"
+            )
+
+        return prepared_hotels
+
     def extract_hotels_from_page(
         self,
-        max_hotels: int = None,
+        max_hotels: Optional[int] = None,
         exclude_ids: Optional[set[str]] = None,
         min_review_count: Optional[int] = None,
         sort_strategy: Optional[str] = None,
         price_range: Optional[dict] = None,
+        page_callback: Optional[Callable[[list[dict], int], None]] = None,
     ) -> list[dict]:
         """从当前页面提取酒店信息（支持翻页）
 
@@ -119,7 +210,13 @@ class HotelListCrawler:
             # 再等待一下确保数据加载完成
             time.sleep(3)
 
-            self.anti_crawler.scroll_to_bottom(step=500, max_scrolls=5)
+            try:
+                self.anti_crawler.scroll_to_bottom(step=500, max_scrolls=5)
+                if self.anti_crawler.check_captcha():
+                    self.anti_crawler.handle_captcha()
+            except (CaptchaException, CaptchaCooldownException) as exc:
+                self._log_captcha_failure("页面滚动", exc)
+                raise
             time.sleep(2)
 
             # 直接从HTML源码提取（优先解析页面内置的查询数据）
@@ -130,13 +227,22 @@ class HotelListCrawler:
 
             if page_info:
                 try:
-                    page_no = int(page_info.get("currentPage"))
+                    current_page_raw = page_info.get("currentPage")
+                    if current_page_raw is not None:
+                        page_no = int(str(current_page_raw))
                 except Exception:
                     page_no = current_page
                 try:
-                    total_page = int(page_info.get("totalPage"))
+                    total_page_raw = page_info.get("totalPage")
+                    if total_page_raw is not None:
+                        total_page = int(str(total_page_raw))
                 except Exception:
                     total_page = None
+
+            self._update_position_context(
+                current_page=page_no,
+                current_url=getattr(page, "url", "") or None,
+            )
 
 
             logger.info(f"正在提取第 {page_no} 页...")
@@ -144,6 +250,7 @@ class HotelListCrawler:
             # 统计本页新增的酒店数
             new_count = 0
             skipped_low_review = 0
+            page_hotels = []
 
             hotels_on_page = self._extract_hotels_from_query_data(html)
             if hotels_on_page:
@@ -204,6 +311,7 @@ class HotelListCrawler:
                         continue
 
                     all_hotels.append(hotel_data)
+                    page_hotels.append(hotel_data)
                     seen_hotel_ids.add(hotel_id)
                     new_count += 1
 
@@ -222,12 +330,12 @@ class HotelListCrawler:
                     # 检查是否已经提取过
                     if hotel_id in seen_hotel_ids or hotel_id in exclude_ids:
                         continue
-                    if price_range and not self._price_in_range(hotel_data.get('base_price'), price_range):
-                        continue
 
                     try:
                         hotel_data = self._extract_hotel_from_html(html, hotel_id)
                         if hotel_data:
+                            if price_range and not self._price_in_range(hotel_data.get('base_price'), price_range):
+                                continue
                             review_count = hotel_data.get('review_count') or 0
                             try:
                                 review_count = int(review_count)
@@ -237,6 +345,7 @@ class HotelListCrawler:
                                 skipped_low_review += 1
                                 continue
                             all_hotels.append(hotel_data)
+                            page_hotels.append(hotel_data)
                             seen_hotel_ids.add(hotel_id)
                             new_count += 1
 
@@ -251,6 +360,9 @@ class HotelListCrawler:
             logger.info(
                 f"第 {page_no} 页新增 {new_count} 家酒店，跳过低评论 {skipped_low_review}，累计 {len(all_hotels)} 家"
             )
+
+            if page_callback and page_hotels:
+                page_callback(page_hotels, page_no)
             
             # 检查是否需要翻页
             if total_page and page_no >= total_page:
@@ -264,9 +376,13 @@ class HotelListCrawler:
                 break
             
             # 尝试翻页
-            if not self._go_to_next_page(page_info):
-                logger.info("没有下一页或翻页失败，停止提取")
-                break
+            try:
+                if not self._go_to_next_page(page_info):
+                    logger.info("没有下一页或翻页失败，停止提取")
+                    break
+            except (CaptchaException, CaptchaCooldownException) as exc:
+                self._log_captcha_failure("列表翻页", exc)
+                raise
             
             current_page += 1
             
@@ -598,15 +714,21 @@ class HotelListCrawler:
 
         if page_info:
             try:
-                current_page = int(page_info.get("currentPage"))
+                current_page_raw = page_info.get("currentPage")
+                if current_page_raw is not None:
+                    current_page = int(str(current_page_raw))
             except Exception:
                 current_page = None
             try:
-                total_page = int(page_info.get("totalPage"))
+                total_page_raw = page_info.get("totalPage")
+                if total_page_raw is not None:
+                    total_page = int(str(total_page_raw))
             except Exception:
                 total_page = None
             try:
-                page_size = int(page_info.get("pageSize"))
+                page_size_raw = page_info.get("pageSize")
+                if page_size_raw is not None:
+                    page_size = int(str(page_size_raw))
             except Exception:
                 page_size = None
 
@@ -631,13 +753,22 @@ class HotelListCrawler:
                         continue
                     seen.add(url)
                     logger.debug(f"Try page URL: {url}")
-                    if not self.anti_crawler.navigate_to(url):
-                        continue
+                    self._update_position_context(current_url=url)
+                    try:
+                        if not self.anti_crawler.navigate_to(url):
+                            continue
+                    except (CaptchaException, CaptchaCooldownException) as exc:
+                        self._log_captcha_failure("URL翻页导航", exc)
+                        raise
                     time.sleep(2)
                     new_info = self._get_query_page_info(page.html)
                     if new_info:
                         try:
-                            new_page = int(new_info.get("currentPage"))
+                            new_page_raw = new_info.get("currentPage")
+                            if new_page_raw is not None:
+                                new_page = int(str(new_page_raw))
+                            else:
+                                new_page = None
                         except Exception:
                             new_page = None
                         if new_page and new_page != current_page:
@@ -680,7 +811,13 @@ class HotelListCrawler:
             next_button.click()
 
             time.sleep(2)
+            if self.anti_crawler.check_captcha():
+                self.anti_crawler.handle_captcha()
             return True
+
+        except (CaptchaException, CaptchaCooldownException) as exc:
+            self._log_captcha_failure("点击翻页", exc)
+            raise
 
         except Exception as e:
             logger.debug(f"Pagination failed: {e}")
@@ -844,7 +981,7 @@ class HotelListCrawler:
         region_type: str,
         business_zone: dict,
         price_range: dict,
-        target_count: int = None,
+        target_count: Optional[int] = None,
         exclude_ids: Optional[set[str]] = None,
         save_to_db: bool = True,
     ) -> list[dict]:
@@ -866,6 +1003,17 @@ class HotelListCrawler:
 
         logger.info(f"开始爬取: {region_type} - {zone_name} - {price_level} (目标: {top_n}家)")
 
+        saved_hotel_ids = self._get_saved_hotel_ids(region_type, zone_code, price_level) if save_to_db else set()
+        remaining_target = max(top_n - len(saved_hotel_ids), 0)
+        if saved_hotel_ids:
+            logger.info(
+                f"检测到已保存进度: {region_type} - {zone_name} - {price_level} "
+                f"已有{len(saved_hotel_ids)}家, 本次补采{remaining_target}家"
+            )
+        if remaining_target <= 0:
+            logger.info(f"{region_type} - {zone_name} - {price_level} 已达到目标数量，跳过重爬")
+            return []
+
         # 构建URL
         url = self.build_search_url(
             business_zone_code=zone_code,
@@ -873,10 +1021,26 @@ class HotelListCrawler:
             price_max=price_range['max'],
         )
 
+        self._update_position_context(
+            region_type=region_type,
+            business_zone=zone_name,
+            business_zone_code=zone_code,
+            price_level=price_level,
+            target_count=remaining_target,
+            saved_count=len(saved_hotel_ids),
+            current_page=1,
+            current_url=url,
+        )
+
         # 导航到页面
-        if not self.anti_crawler.navigate_to(url):
-            logger.error(f"导航失败: {url}")
-            return []
+        try:
+            if not self.anti_crawler.navigate_to(url):
+                logger.error(f"导航失败: {url}")
+                self._clear_position_context()
+                return []
+        except (CaptchaException, CaptchaCooldownException) as exc:
+            self._log_captcha_failure("酒店列表导航", exc)
+            raise
 
         # 等待页面加载 - 增加等待时间
         logger.info("等待页面完全加载...")
@@ -885,47 +1049,44 @@ class HotelListCrawler:
 
 
         # 提取酒店（支持翻页，直到达到目标数量）
-        hotels = self.extract_hotels_from_page(
-            max_hotels=top_n,
-            exclude_ids=exclude_ids,
+        hotels = []
+        effective_exclude_ids = set(exclude_ids) if exclude_ids else set()
+        effective_exclude_ids.update(saved_hotel_ids)
+
+        def persist_page_hotels(page_hotels: list[dict], page_no: int) -> None:
+            prepared_hotels = self._prepare_hotels_for_price_range(
+                hotels=page_hotels,
+                region_type=region_type,
+                zone_name=zone_name,
+                zone_code=zone_code,
+                price_range=price_range,
+            )
+            if not prepared_hotels:
+                return
+
+            self._save_hotels(prepared_hotels)
+            hotels.extend(prepared_hotels)
+            self._update_position_context(saved_count=len(saved_hotel_ids) + len(hotels), current_page=page_no)
+
+        raw_hotels = self.extract_hotels_from_page(
+            max_hotels=remaining_target,
+            exclude_ids=effective_exclude_ids,
             min_review_count=settings.min_reviews_threshold,
             price_range=price_range,
+            page_callback=persist_page_hotels if save_to_db else None,
         )
 
-        # 按起步价校验所属档次，确保价格区间与档次一致
-        filtered_hotels = []
-        skipped_no_price = 0
-        skipped_price_mismatch = 0
-        for hotel in hotels:
-            base_price = hotel.get('base_price')
-            mapped_level = self._map_price_level(base_price)
-            if mapped_level is None:
-                skipped_no_price += 1
-                continue
-            if not self._price_in_range(base_price, price_range):
-                skipped_price_mismatch += 1
-                continue
-
-            hotel['region_type'] = region_type
-            hotel['business_zone'] = zone_name
-            hotel['business_zone_code'] = zone_code
-            hotel['price_level'] = mapped_level
-            hotel['city_code'] = '440100'
-            filtered_hotels.append(hotel)
-
-        if skipped_no_price or skipped_price_mismatch:
-            logger.info(
-                f"{zone_name} - {price_level} 过滤: "
-                f"无价格{skipped_no_price}家, 价格不匹配{skipped_price_mismatch}家"
+        if not save_to_db:
+            hotels = self._prepare_hotels_for_price_range(
+                hotels=raw_hotels,
+                region_type=region_type,
+                zone_name=zone_name,
+                zone_code=zone_code,
+                price_range=price_range,
             )
-        hotels = filtered_hotels
 
-        logger.info(f"爬取完成: {len(hotels)}/{top_n} 家酒店")
-
-        # 保存到数据库
-        if save_to_db and hotels:
-            self._save_hotels(hotels)
-
+        logger.info(f"爬取完成: {len(saved_hotel_ids) + len(hotels)}/{top_n} 家酒店 (新增{len(hotels)}家)")
+        self._clear_position_context()
         return hotels
 
     def crawl_region(self, region_type: str, save_to_db: bool = True) -> list[dict]:
@@ -1159,6 +1320,9 @@ class HotelListCrawler:
             for hotel_data in hotels:
                 try:
                     hotel_id = hotel_data.get('hotel_id')
+                    if hotel_id is None:
+                        logger.debug("跳过缺少 hotel_id 的酒店详情获取")
+                        continue
                     business_zone_code = hotel_data.get('business_zone_code')
                     price_level = hotel_data.get('price_level')
                     
@@ -1178,7 +1342,7 @@ class HotelListCrawler:
                     # 如果是新酒店且需要获取详情
                     if fetch_details and hotel_id not in existing_dict:
                         logger.info(f"获取酒店 {hotel_id} 的详细信息...")
-                        details = self.fetch_hotel_details(hotel_id)
+                        details = self.fetch_hotel_details(str(hotel_id))
                         
                         if details:
                             # 合并详细信息
@@ -1229,7 +1393,7 @@ class HotelListCrawler:
         logger.info(f"保存完成: 新增{saved_count}家, 更新{updated_count}家, 跳过{skipped_count}家, 共处理{total}家")
         return total
 
-    def enrich_hotel_details(self, hotel_ids: list[str] = None) -> int:
+    def enrich_hotel_details(self, hotel_ids: Optional[list[str]] = None) -> int:
         """补充酒店的详细信息
         
         Args:
@@ -1265,7 +1429,11 @@ class HotelListCrawler:
                 try:
                     logger.info(f"[{i}/{total}] 获取酒店 {hotel.hotel_id} ({hotel.name}) 的详细信息...")
                     
-                    details = self.fetch_hotel_details(hotel.hotel_id)
+                    if hotel.hotel_id is None:
+                        logger.warning(f"酒店记录缺少 hotel_id，跳过: {hotel}")
+                        continue
+
+                    details = self.fetch_hotel_details(str(hotel.hotel_id))
                     
                     if details:
                         # 更新酒店信息

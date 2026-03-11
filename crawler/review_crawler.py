@@ -16,6 +16,7 @@ from utils.validator import ReviewModel
 from database.connection import session_scope
 from database.models import Hotel, Review, ReviewImage, ReviewReply
 from .anti_crawler import AntiCrawler
+from .exceptions import CaptchaCooldownException, CaptchaException, CaptchaTimeoutException
 
 logger = get_logger("review_crawler")
 
@@ -32,7 +33,16 @@ class ReviewCrawler:
     FILTER_MEDIUM = 2    # 中评 (3分)
     FILTER_BAD = 3       # 差评 (1-2分)
 
-    def __init__(self, anti_crawler: AntiCrawler = None):
+    VERIFICATION_EXPIRED_KEYWORDS = (
+        "验证已过期",
+        "验证失效",
+        "请刷新",
+        "页面已失效",
+        "重新验证",
+        "点击刷新",
+    )
+
+    def __init__(self, anti_crawler: Optional[AntiCrawler] = None):
         """初始化爬虫
 
         Args:
@@ -41,7 +51,7 @@ class ReviewCrawler:
         self.anti_crawler = anti_crawler or AntiCrawler()
         self.crawled_review_ids = set()  # 用于去重
 
-    def _generate_review_id(self, hotel_id: str, content: str, user_nick: str = None) -> str:
+    def _generate_review_id(self, hotel_id: str, content: str, user_nick: Optional[str] = None) -> str:
         """生成唯一的评论ID
         
         Args:
@@ -61,6 +71,64 @@ class ReviewCrawler:
     def get_hotel_detail_url(self, hotel_id: str) -> str:
         """获取酒店详情页URL"""
         return self.DETAIL_URL_TEMPLATE.format(hotel_id=hotel_id)
+
+    def _log_captcha_failure(
+        self,
+        action: str,
+        hotel_id: str,
+        source_pool: Optional[str],
+        progress: str,
+        exc: Exception,
+    ) -> None:
+        """记录验证码失败上下文。"""
+        logger.error(
+            f"验证码中断: action={action}, hotel_id={hotel_id}, "
+            f"source_pool={source_pool or 'navigation'}, progress={progress}, error={exc}"
+        )
+
+    def _ensure_review_page_ready(
+        self,
+        hotel_id: str,
+        source_pool: Optional[str],
+        action: str,
+        progress: str,
+    ) -> None:
+        """在评论交互和解析前确认页面未被验证码或失效验证页中断。"""
+        page = self.anti_crawler.get_page()
+
+        try:
+            html = page.html or ""
+        except Exception:
+            html = ""
+
+        if any(keyword in html for keyword in self.VERIFICATION_EXPIRED_KEYWORDS):
+            exc = CaptchaTimeoutException(
+                timeout_seconds=settings.captcha_solve_timeout_seconds,
+                elapsed_seconds=0,
+                retry_count=1,
+                max_retries=settings.captcha_max_retries,
+            )
+            self._log_captcha_failure(action, hotel_id, source_pool, progress, exc)
+            raise exc
+
+        if not self.anti_crawler.check_captcha():
+            return
+
+        try:
+            self.anti_crawler.handle_captcha()
+        except (CaptchaException, CaptchaCooldownException) as exc:
+            self._log_captcha_failure(action, hotel_id, source_pool, progress, exc)
+            raise
+
+        if self.anti_crawler.check_captcha():
+            exc = CaptchaTimeoutException(
+                timeout_seconds=settings.captcha_solve_timeout_seconds,
+                elapsed_seconds=0,
+                retry_count=1,
+                max_retries=settings.captcha_max_retries,
+            )
+            self._log_captcha_failure(action, hotel_id, source_pool, progress, exc)
+            raise exc
 
     def get_total_review_count(self) -> Optional[int]:
         """获取当前页面的总评论数
@@ -98,11 +166,16 @@ class ReviewCrawler:
         """
         url = self.get_hotel_detail_url(hotel_id)
 
-        if not self.anti_crawler.navigate_to(url):
-            return False
+        try:
+            if not self.anti_crawler.navigate_to(url):
+                return False
+        except (CaptchaException, CaptchaCooldownException) as exc:
+            self._log_captcha_failure("navigate_to_reviews", hotel_id, None, "0/0", exc)
+            raise
 
         # 等待页面加载
         self.anti_crawler.random_delay(2, 3)
+        self._ensure_review_page_ready(hotel_id, None, "review_page_navigation", "0/0")
 
         # 滚动到评论区域
         page = self.anti_crawler.get_page()
@@ -110,10 +183,17 @@ class ReviewCrawler:
         if review_section:
             review_section.scroll.to_see()
             self.anti_crawler.random_delay(1, 2)
+            self._ensure_review_page_ready(hotel_id, None, "review_section_scroll", "0/0")
 
         return True
 
-    def filter_reviews(self, filter_type: int) -> bool:
+    def filter_reviews(
+        self,
+        filter_type: int,
+        hotel_id: Optional[str] = None,
+        source_pool: Optional[str] = None,
+        progress: str = "0/0",
+    ) -> bool:
         """筛选评论类型
         
         支持多个备用选择器，增强兼容性
@@ -125,6 +205,8 @@ class ReviewCrawler:
             是否成功
         """
         page = self.anti_crawler.get_page()
+        if hotel_id:
+            self._ensure_review_page_ready(hotel_id, source_pool, "filter_reviews_precheck", progress)
 
         # 主选择器映射（多个备用选择器）
         filter_map = {
@@ -160,12 +242,16 @@ class ReviewCrawler:
                         filter_elem.click()
 
                     self.anti_crawler.random_delay(1, 2)
+                    if hotel_id:
+                        self._ensure_review_page_ready(hotel_id, source_pool, "filter_reviews_click", progress)
 
                     # 验证是否生效
                     if self._verify_filter_applied(filter_type):
                         logger.debug(f"评论筛选成功: 类型={filter_type}, 选择器={selector}")
                         return True
 
+            except (CaptchaException, CaptchaCooldownException):
+                raise
             except Exception as e:
                 logger.debug(f"选择器 {selector} 失败: {e}")
                 continue
@@ -206,7 +292,13 @@ class ReviewCrawler:
         # 如果无法验证，假设成功（避免过度严格）
         return True
 
-    def filter_with_images(self, enabled: bool = True) -> bool:
+    def filter_with_images(
+        self,
+        enabled: bool = True,
+        hotel_id: Optional[str] = None,
+        source_pool: Optional[str] = None,
+        progress: str = "0/0",
+    ) -> bool:
         """筛选有图评论
 
         Args:
@@ -216,6 +308,8 @@ class ReviewCrawler:
             是否成功
         """
         page = self.anti_crawler.get_page()
+        if hotel_id:
+            self._ensure_review_page_ready(hotel_id, source_pool, "filter_with_images_precheck", progress)
 
         # 有图筛选checkbox
         checkbox = page.ele('#review-addreply', timeout=3)
@@ -225,15 +319,24 @@ class ReviewCrawler:
             if enabled and not is_checked:
                 checkbox.click()
                 self.anti_crawler.random_delay(1, 2)
+                if hotel_id:
+                    self._ensure_review_page_ready(hotel_id, source_pool, "filter_with_images_click", progress)
                 return True
             elif not enabled and is_checked:
                 checkbox.click()
                 self.anti_crawler.random_delay(1, 2)
+                if hotel_id:
+                    self._ensure_review_page_ready(hotel_id, source_pool, "filter_with_images_click", progress)
                 return True
 
         return True
 
-    def extract_reviews_from_page(self, hotel_id: str, source_pool: str) -> list[dict]:
+    def extract_reviews_from_page(
+        self,
+        hotel_id: str,
+        source_pool: str,
+        progress: str = "0/0",
+    ) -> list[dict]:
         """从当前页面提取评论
 
         Args:
@@ -243,6 +346,7 @@ class ReviewCrawler:
         Returns:
             评论数据列表
         """
+        self._ensure_review_page_ready(hotel_id, source_pool, "extract_reviews_from_page", progress)
         page = self.anti_crawler.get_page()
         reviews = []
 
@@ -264,6 +368,8 @@ class ReviewCrawler:
                     if review_id:
                         self.crawled_review_ids.add(review_id)
 
+            except (CaptchaException, CaptchaCooldownException):
+                raise
             except Exception as e:
                 logger.warning(f"解析评论元素失败: {e}")
                 continue
@@ -361,6 +467,8 @@ class ReviewCrawler:
                 'reply_date': reply_date,
             }
 
+        except (CaptchaException, CaptchaCooldownException):
+            raise
         except Exception as e:
             logger.debug(f"解析评论异常: {e}")
             return None
@@ -400,7 +508,13 @@ class ReviewCrawler:
 
         return scores
 
-    def load_more_reviews(self, max_pages: int = 30) -> int:
+    def load_more_reviews(
+        self,
+        max_pages: int = 30,
+        hotel_id: Optional[str] = None,
+        source_pool: Optional[str] = None,
+        progress: str = "0/0",
+    ) -> int:
         """加载更多评论（翻页）
 
         Args:
@@ -411,6 +525,9 @@ class ReviewCrawler:
         """
         page = self.anti_crawler.get_page()
         pages_loaded = 0
+
+        if hotel_id:
+            self._ensure_review_page_ready(hotel_id, source_pool, "load_more_reviews_precheck", progress)
 
         for _ in range(max_pages):
             # 查找下一页按钮
@@ -426,12 +543,14 @@ class ReviewCrawler:
             pages_loaded += 1
 
             # 检查验证码
-            if self.anti_crawler.check_captcha():
+            if hotel_id:
+                self._ensure_review_page_ready(hotel_id, source_pool, "load_more_reviews_click", progress)
+            elif self.anti_crawler.check_captcha():
                 self.anti_crawler.handle_captcha()
 
         return pages_loaded
 
-    def waterfall_crawl(self, hotel_id: str, max_reviews: int = None) -> list[dict]:
+    def waterfall_crawl(self, hotel_id: str, max_reviews: Optional[int] = None) -> list[dict]:
         """瀑布流采集策略
 
         按优先级依次爬取：
@@ -535,26 +654,48 @@ class ReviewCrawler:
             if len(reviews) >= max_count:
                 break
 
+            progress = f"{len(reviews)}/{max_count}"
+
             # 应用筛选
-            self.filter_reviews(filter_type)
-            if with_images:
-                self.filter_with_images(True)
-            else:
-                self.filter_with_images(False)
+            try:
+                self.filter_reviews(filter_type, hotel_id=hotel_id, source_pool=source_pool, progress=progress)
+            except (CaptchaException, CaptchaCooldownException) as exc:
+                self._log_captcha_failure("filter_reviews", hotel_id, source_pool, progress, exc)
+                raise
+
+            try:
+                if with_images:
+                    self.filter_with_images(True, hotel_id=hotel_id, source_pool=source_pool, progress=progress)
+                else:
+                    self.filter_with_images(False, hotel_id=hotel_id, source_pool=source_pool, progress=progress)
+            except (CaptchaException, CaptchaCooldownException) as exc:
+                self._log_captcha_failure("filter_with_images", hotel_id, source_pool, progress, exc)
+                raise
 
             self.anti_crawler.random_delay(1, 2)
 
             # 爬取当前页
-            page_reviews = self.extract_reviews_from_page(hotel_id, source_pool)
+            page_reviews = self.extract_reviews_from_page(hotel_id, source_pool, progress=progress)
             reviews.extend(page_reviews)
 
             # 翻页继续爬取
             while len(reviews) < max_count:
-                pages = self.load_more_reviews(max_pages=1)
+                progress = f"{len(reviews)}/{max_count}"
+                try:
+                    pages = self.load_more_reviews(
+                        max_pages=1,
+                        hotel_id=hotel_id,
+                        source_pool=source_pool,
+                        progress=progress,
+                    )
+                except (CaptchaException, CaptchaCooldownException) as exc:
+                    self._log_captcha_failure("load_more_reviews", hotel_id, source_pool, progress, exc)
+                    raise
+
                 if pages == 0:
                     break
 
-                page_reviews = self.extract_reviews_from_page(hotel_id, source_pool)
+                page_reviews = self.extract_reviews_from_page(hotel_id, source_pool, progress=progress)
                 if not page_reviews:
                     break
 
