@@ -6,7 +6,7 @@
 
 ```
 crawler/
-├── anti_crawler.py        # 285行 — 浏览器接管/反爬/验证码/导航/滚动
+├── anti_crawler.py        # 320行 — 浏览器接管/自动化验证码/导航/滚动
 ├── hotel_list_crawler.py    # 1304行 — 酒店列表爬取 (最大文件, 建议拆分)
 └── review_crawler.py        # 645行 — 评论瀑布流采集
 ```
@@ -52,8 +52,10 @@ main.py
 | `init_browser` | 26 | CDP连接Chrome | 地址来自 `settings.chrome_address` (127.0.0.1:9222) |
 | `random_delay` | 54 | 随机延迟 | `random.uniform(min, max)` → `time.sleep` |
 | `check_captcha` | 67 | 检测验证码 | 5个CSS选择器: `#nc_1_n1z`, `.nc-container` 等 |
-| `_auto_slide_captcha` | 129 | 自动滑块 | 分段滑动+Y轴抖动+随机暂停, 模拟人类 |
-| `handle_captcha` | 91 | 验证码处理 | 自动滑→失败→`input()`等待人工 |
+| `handle_captcha` | 146 | 验证码处理 | 自动滑块→有界重试→冷却停止（无人工回退） |
+| `_is_verification_expired` | 116 | 验证页过期检测 | 检测验证页面是否超时失效 |
+| `_refresh_verification_page` | 139 | 刷新验证页 | 刷新过期的验证页面，最多2次 |
+| `_auto_slide_captcha` | 231 | 自动滑块 | S曲线轨迹+抖动+超冲，模拟人类行为 |
 | `navigate_to` | 204 | 导航+验证码检查 | 每次导航后自动check_captcha |
 | `scroll_to_bottom` | 250 | 滚动到底 | JS获取scrollHeight判断是否到底 |
 | `safe_navigate` | 276 | 带重试导航 | `@retry(stop=3, wait=exponential)` |
@@ -166,10 +168,41 @@ main.py
 ## KNOWN BUGS & RISKS
 
 1. **hotel_list_crawler.py:225** — HTML回退分支 `hotel_data` 变量泄漏: `_price_in_range(hotel_data.get('base_price'), price_range)` 中的 `hotel_data` 是上一次循环的值，应为当前 `hotel_id` 对应的数据
-2. **review_crawler.py:207** — `_verify_filter_applied` 最终 `return True` 即使无法验证，可能导致在错误筛选状态下采集
-3. **瀑布流池配额硬编码** — negative=100, evidence=150 写死在方法体内，应提取到settings
-4. **CSS选择器脆弱** — 飞猪改版会导致 `.tb-r-comment`, `.tb-r-cnt`, `.starscore` 等批量失效
-5. **hotel_list_crawler.py 过大** — 1304行单文件，建议拆分: 提取逻辑/翻页逻辑/入库逻辑/弹性补位
+2. **瀑布流池配额硬编码** — negative=100, evidence=150 写死在方法体内，应提取到settings
+3. **CSS选择器脆弱** — 飞猪改版会导致 `.tb-r-comment`, `.tb-r-cnt`, `.starscore` 等批量失效
+4. **hotel_list_crawler.py 过大** — 1304行单文件，建议拆分: 提取逻辑/翻页逻辑/入库逻辑/弹性补位
+
+## CAPTCHA AUTOMATION
+
+### Configuration (config/settings.py)
+- `CAPTCHA_MAX_RETRIES = 3`: Maximum retry attempts
+- `CAPTCHA_TIMEOUT = 120`: Verification timeout in seconds
+- `CAPTCHA_COOLDOWN = 180`: Cooldown period after max retries
+- `CAPTCHA_REFRESH_RETRY_LIMIT = 2`: Max verification page refreshes
+
+### Exception Hierarchy (crawler/exceptions.py)
+- `CrawlerException`: Base exception
+  - `CaptchaException`: Retryable captcha failure (should_retry() = True)
+  - `CaptchaCooldownException`: Terminal cooldown (should_retry() = False)
+
+### Automated Flow
+1. Navigate to page → check_captcha()
+2. If captcha detected → handle_captcha()
+3. Attempt auto_slide_captcha() with human-like trajectory
+4. If verification page expired → refresh_verification_page()
+5. Retry up to CAPTCHA_MAX_RETRIES times
+6. If max retries exhausted → raise CaptchaCooldownException
+7. CLI/scheduler catch cooldown exception → stop task, log cooldown message
+
+### Recovery Behavior
+- Hotel list: Per-page incremental save, resume from next page
+- Reviews: Per-pool checkpoint save, completed pools survive interruption
+- Task state preserved for later retry after cooldown period
+
+### Test Coverage (tests/)
+- `test_anti_crawler_captcha.py`: 7 captcha engine tests
+- `test_captcha_recovery.py`: 6 recovery/interruption tests
+- All 32 tests passing
 
 ## WHERE TO LOOK (CRAWLER-SPECIFIC)
 
