@@ -21,16 +21,39 @@
 """
 import argparse
 import sys
+from typing import Optional
+
 from tqdm import tqdm
 
 from config.settings import settings
 from config.regions import GUANGZHOU_REGIONS, calculate_expected_hotels
 from utils.logger import setup_logger, get_logger
 from database.connection import init_db, check_connection
-from crawler import AntiCrawler, HotelListCrawler, ReviewCrawler
+from crawler import (
+    AntiCrawler,
+    HotelListCrawler,
+    ReviewCrawler,
+    CaptchaException,
+    CaptchaCooldownException,
+)
 from scheduler import TaskScheduler
 
 logger = get_logger("main")
+
+EXIT_SUCCESS = 0
+EXIT_FAILURE = 1
+EXIT_CAPTCHA_COOLDOWN = 2
+
+
+def _log_retryable_captcha_stop(action: str, error: CaptchaException):
+    """记录可立即重试的验证码失败。"""
+    logger.error(f"{action}遇到验证码失败，可立即重试: {error}")
+
+
+def _log_captcha_cooldown_stop(action: str, error: CaptchaCooldownException):
+    """记录验证码冷却停止。"""
+    logger.warning(f"{action}因验证码冷却停止: {error.reason}")
+    logger.info(f"请等待至少 {error.cooldown_seconds}s 后再重试当前任务")
 
 
 def test_mode():
@@ -84,7 +107,7 @@ def test_mode():
     print("=" * 60)
 
 
-def crawl_hotel_list(region: str = None, all_regions: bool = False):
+def crawl_hotel_list(region: Optional[str] = None, all_regions: bool = False):
     """爬取酒店列表
 
     Args:
@@ -108,20 +131,31 @@ def crawl_hotel_list(region: str = None, all_regions: bool = False):
             if region not in GUANGZHOU_REGIONS:
                 logger.error(f"未知的功能区: {region}")
                 logger.info(f"可用的功能区: {list(GUANGZHOU_REGIONS.keys())}")
-                return
+                return EXIT_FAILURE
 
             hotels = crawler.crawl_region(region, save_to_db=True)
             logger.info(f"功能区 {region} 爬取完成，共 {len(hotels)} 家酒店")
 
         else:
             logger.error("请指定功能区 (--region) 或使用 --all 爬取所有功能区")
+            return EXIT_FAILURE
 
     except KeyboardInterrupt:
         logger.warning("用户中断爬取")
+        return EXIT_FAILURE
+    except CaptchaCooldownException as e:
+        _log_captcha_cooldown_stop("酒店列表爬取", e)
+        return EXIT_CAPTCHA_COOLDOWN
+    except CaptchaException as e:
+        _log_retryable_captcha_stop("酒店列表爬取", e)
+        return EXIT_FAILURE
     except Exception as e:
         logger.error(f"爬取失败: {e}")
+        return EXIT_FAILURE
     finally:
         anti_crawler.close()
+
+    return EXIT_SUCCESS
 
 
 def enrich_hotel_details():
@@ -141,13 +175,23 @@ def enrich_hotel_details():
         
     except KeyboardInterrupt:
         logger.warning("用户中断补充")
+        return EXIT_FAILURE
+    except CaptchaCooldownException as e:
+        _log_captcha_cooldown_stop("酒店详情补充", e)
+        return EXIT_CAPTCHA_COOLDOWN
+    except CaptchaException as e:
+        _log_retryable_captcha_stop("酒店详情补充", e)
+        return EXIT_FAILURE
     except Exception as e:
         logger.error(f"补充失败: {e}")
+        return EXIT_FAILURE
     finally:
         anti_crawler.close()
 
+    return EXIT_SUCCESS
 
-def crawl_reviews(hotel_id: str = None, all_hotels: bool = False):
+
+def crawl_reviews(hotel_id: Optional[str] = None, all_hotels: bool = False):
     """爬取评论
 
     Args:
@@ -175,19 +219,34 @@ def crawl_reviews(hotel_id: str = None, all_hotels: bool = False):
 
             # 执行任务
             for task in tqdm(scheduler.get_pending_tasks(task_type="review"), desc="爬取评论"):
-                try:
-                    scheduler.start_task(task.task_id)
+                task_id = str(task.task_id)
+                current_hotel_id = str(task.hotel_id)
 
-                    reviews = crawler.crawl_hotel_reviews(task.hotel_id, save_to_db=True)
+                try:
+                    scheduler.start_task(task_id)
+
+                    reviews = crawler.crawl_hotel_reviews(current_hotel_id, save_to_db=True)
 
                     if reviews:
-                        scheduler.complete_task(task.task_id, len(reviews))
+                        scheduler.complete_task(task_id, len(reviews))
                     else:
-                        scheduler.skip_task(task.task_id, "无评论数据")
+                        scheduler.skip_task(task_id, "无评论数据")
 
+                except CaptchaCooldownException as e:
+                    scheduler.stop_task_for_cooldown(task_id, str(e), e.cooldown_seconds)
+                    logger.warning(
+                        f"任务 {task_id} 因验证码冷却停止，保留为待重试状态"
+                    )
+                    logger.info(
+                        f"酒店 {current_hotel_id} 需等待至少 {e.cooldown_seconds}s 后再继续"
+                    )
+                    return EXIT_CAPTCHA_COOLDOWN
+                except CaptchaException as e:
+                    scheduler.fail_task(task_id, str(e))
+                    logger.error(f"任务 {task_id} 验证码失败，可立即重试: {e}")
                 except Exception as e:
-                    scheduler.fail_task(task.task_id, str(e))
-                    logger.error(f"任务 {task.task_id} 失败: {e}")
+                    scheduler.fail_task(task_id, str(e))
+                    logger.error(f"任务 {task_id} 失败: {e}")
 
                 # 任务间延迟
                 anti_crawler.random_delay(3, 6)
@@ -198,13 +257,24 @@ def crawl_reviews(hotel_id: str = None, all_hotels: bool = False):
 
         else:
             logger.error("请指定酒店ID (--hotel-id) 或使用 --all 爬取所有酒店的评论")
+            return EXIT_FAILURE
 
     except KeyboardInterrupt:
         logger.warning("用户中断爬取")
+        return EXIT_FAILURE
+    except CaptchaCooldownException as e:
+        _log_captcha_cooldown_stop("评论爬取", e)
+        return EXIT_CAPTCHA_COOLDOWN
+    except CaptchaException as e:
+        _log_retryable_captcha_stop("评论爬取", e)
+        return EXIT_FAILURE
     except Exception as e:
         logger.error(f"爬取失败: {e}")
+        return EXIT_FAILURE
     finally:
         anti_crawler.close()
+
+    return EXIT_SUCCESS
 
 
 def main():
@@ -255,16 +325,19 @@ def main():
     # 根据模式执行
     if args.mode == "test":
         test_mode()
+        return EXIT_SUCCESS
 
     elif args.mode == "hotel_list":
-        crawl_hotel_list(region=args.region, all_regions=args.all)
+        return crawl_hotel_list(region=args.region, all_regions=args.all)
 
     elif args.mode == "enrich_details":
-        enrich_hotel_details()
+        return enrich_hotel_details()
 
     elif args.mode == "reviews":
-        crawl_reviews(hotel_id=args.hotel_id, all_hotels=args.all)
+        return crawl_reviews(hotel_id=args.hotel_id, all_hotels=args.all)
+
+    return EXIT_FAILURE
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

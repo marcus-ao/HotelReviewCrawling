@@ -1,10 +1,12 @@
+# pyright: reportGeneralTypeIssues=false, reportAssignmentType=false, reportArgumentType=false, reportAttributeAccessIssue=false
+
 """任务调度器模块
 
 管理爬取任务的创建、执行和状态跟踪。
 """
 import uuid
 from datetime import datetime
-from typing import Optional, Generator
+from typing import Any, Generator, Optional, cast
 
 from config.regions import GUANGZHOU_REGIONS
 from utils.logger import get_logger
@@ -132,7 +134,7 @@ class TaskScheduler:
 
         return region_priority.get(region_type, 0) + price_priority.get(price_level, 0)
 
-    def _calculate_review_priority(self, hotel: Hotel) -> int:
+    def _calculate_review_priority(self, hotel: Any) -> int:
         """计算评论任务优先级
 
         Args:
@@ -144,23 +146,25 @@ class TaskScheduler:
         priority = 0
 
         # 评论数越多优先级越高
-        if hotel.review_count:
-            if hotel.review_count > 1000:
+        review_count = cast(Optional[int], hotel.review_count)
+        if review_count:
+            if review_count > 1000:
                 priority += 10
-            elif hotel.review_count > 500:
+            elif review_count > 500:
                 priority += 8
-            elif hotel.review_count > 200:
+            elif review_count > 200:
                 priority += 5
 
         # 评分高的优先
-        if hotel.rating_score:
-            priority += int(hotel.rating_score)
+        rating_score = cast(Optional[float], hotel.rating_score)
+        if rating_score:
+            priority += int(rating_score)
 
         return priority
 
     def get_pending_tasks(
         self,
-        task_type: str = None,
+        task_type: Optional[str] = None,
         limit: int = 10
     ) -> Generator[CrawlTask, None, None]:
         """获取待执行的任务
@@ -196,7 +200,7 @@ class TaskScheduler:
             是否成功
         """
         with session_scope() as session:
-            task = session.query(CrawlTask).filter_by(task_id=task_id).first()
+            task = cast(Any, session.query(CrawlTask).filter_by(task_id=task_id).first())
 
             if not task:
                 logger.error(f"任务不存在: {task_id}")
@@ -226,7 +230,7 @@ class TaskScheduler:
             是否成功
         """
         with session_scope() as session:
-            task = session.query(CrawlTask).filter_by(task_id=task_id).first()
+            task = cast(Any, session.query(CrawlTask).filter_by(task_id=task_id).first())
 
             if not task:
                 logger.error(f"任务不存在: {task_id}")
@@ -253,7 +257,7 @@ class TaskScheduler:
             是否成功
         """
         with session_scope() as session:
-            task = session.query(CrawlTask).filter_by(task_id=task_id).first()
+            task = cast(Any, session.query(CrawlTask).filter_by(task_id=task_id).first())
 
             if not task:
                 logger.error(f"任务不存在: {task_id}")
@@ -275,6 +279,47 @@ class TaskScheduler:
             self.current_task_id = None
             return True
 
+    def stop_task_for_cooldown(
+        self,
+        task_id: str,
+        error_message: str,
+        cooldown_seconds: int
+    ) -> bool:
+        """因验证码冷却停止当前任务并保留待重试状态
+
+        Args:
+            task_id: 任务ID
+            error_message: 停止原因
+            cooldown_seconds: 冷却时长（秒）
+
+        Returns:
+            是否成功
+        """
+        with session_scope() as session:
+            task = cast(Any, session.query(CrawlTask).filter_by(task_id=task_id).first())
+
+            if not task:
+                logger.error(f"任务不存在: {task_id}")
+                return False
+
+            task.status = "pending"
+            task.error_message = error_message
+
+            self._log_task(
+                session,
+                task_id,
+                "WARNING",
+                f"任务因验证码冷却停止，保留待重试状态: {error_message}",
+                {"cooldown_seconds": cooldown_seconds, "retryable": False}
+            )
+            logger.warning(
+                f"任务停止: {task_id} - 验证码进入冷却期，"
+                f"{cooldown_seconds}s 后可重试"
+            )
+
+            self.current_task_id = None
+            return True
+
     def skip_task(self, task_id: str, reason: str) -> bool:
         """跳过任务
 
@@ -286,7 +331,7 @@ class TaskScheduler:
             是否成功
         """
         with session_scope() as session:
-            task = session.query(CrawlTask).filter_by(task_id=task_id).first()
+            task = cast(Any, session.query(CrawlTask).filter_by(task_id=task_id).first())
 
             if not task:
                 logger.error(f"任务不存在: {task_id}")
@@ -301,7 +346,14 @@ class TaskScheduler:
             self.current_task_id = None
             return True
 
-    def _log_task(self, session, task_id: str, level: str, message: str, details: dict = None):
+    def _log_task(
+        self,
+        session,
+        task_id: str,
+        level: str,
+        message: str,
+        details: Optional[dict] = None
+    ):
         """记录任务日志
 
         Args:
