@@ -1,22 +1,38 @@
 """酒店列表爬虫模块"""
-import json
+import math
+import importlib
 import re
 import time
-from urllib.parse import urlsplit, urlunsplit, parse_qs, urlencode
+from collections import defaultdict
 from typing import Callable, Optional, Generator
 from datetime import datetime, timedelta
 
 from config.settings import settings
 from config.regions import GUANGZHOU_REGIONS, PRICE_RANGES
 from utils.logger import get_logger
-from utils.cleaner import clean_text, extract_price, normalize_hotel_name
-from utils.validator import HotelModel
+from utils.cleaner import clean_text, normalize_hotel_name
 from database.connection import session_scope
 from database.models import Hotel, CrawlTask
 from .anti_crawler import AntiCrawler
 from .exceptions import CaptchaCooldownException, CaptchaException
 
 logger = get_logger("hotel_list_crawler")
+
+
+def _context_helpers():
+    return importlib.import_module("utils.hotel_list_context")
+
+
+def _pagination_helpers():
+    return importlib.import_module("utils.hotel_list_pagination")
+
+
+def _query_data_helpers():
+    return importlib.import_module("utils.hotel_list_query_data")
+
+
+def _persistence_helpers():
+    return importlib.import_module("utils.hotel_list_persistence")
 
 
 class HotelListCrawler:
@@ -83,38 +99,19 @@ class HotelListCrawler:
 
     def _update_position_context(self, **kwargs) -> None:
         """Update crawl position context for logging/resume hints."""
-        for key, value in kwargs.items():
-            if value is None:
-                self._position_context.pop(key, None)
-            else:
-                self._position_context[key] = value
+        _context_helpers().update_position_context(self._position_context, **kwargs)
 
     def _clear_position_context(self) -> None:
         """Clear crawl position context."""
-        self._position_context.clear()
+        _context_helpers().clear_position_context(self._position_context)
 
     def _format_position_context(self) -> str:
         """Format crawl position context for logs."""
-        ordered_keys = [
-            "region_type",
-            "business_zone",
-            "business_zone_code",
-            "price_level",
-            "target_count",
-            "saved_count",
-            "current_page",
-            "current_url",
-        ]
-        parts = []
-        for key in ordered_keys:
-            value = self._position_context.get(key)
-            if value is not None:
-                parts.append(f"{key}={value}")
-        return ", ".join(parts) if parts else "context=unknown"
+        return _context_helpers().format_position_context(self._position_context)
 
     def _log_captcha_failure(self, action: str, exc: Exception) -> None:
         """Log captcha failure with current crawl context."""
-        logger.error(f"{action} 遇到验证码失败: {exc} | {self._format_position_context()}")
+        _context_helpers().log_captcha_failure(logger, self._position_context, action, exc)
 
     def _get_saved_hotel_ids(
         self,
@@ -123,13 +120,7 @@ class HotelListCrawler:
         price_level: str,
     ) -> set[str]:
         """Load already saved hotel ids for resume-safe crawling."""
-        with session_scope() as session:
-            rows = session.query(Hotel.hotel_id).filter(
-                Hotel.region_type == region_type,
-                Hotel.business_zone_code == business_zone_code,
-                Hotel.price_level == price_level,
-            ).all()
-        return {hotel_id for hotel_id, in rows if hotel_id}
+        return _persistence_helpers().get_saved_hotel_ids(region_type, business_zone_code, price_level)
 
     def _prepare_hotels_for_price_range(
         self,
@@ -169,6 +160,265 @@ class HotelListCrawler:
 
         return prepared_hotels
 
+    def _get_region_saved_hotel_ids(self, region_type: str) -> set[str]:
+        """Load saved hotel ids for a full functional region."""
+        return _persistence_helpers().get_region_saved_hotel_ids(region_type)
+
+    def _count_region_tier_hotels(self, region_type: str, price_level: str) -> int:
+        """Count saved hotels for one region-tier bucket."""
+        return _persistence_helpers().count_region_tier_hotels(region_type, price_level)
+
+    def _get_price_range_by_level(self, region_type: str, price_level: str) -> Optional[dict]:
+        """Find configured price range record by level in a region config."""
+        region_config = GUANGZHOU_REGIONS.get(region_type)
+        if not region_config:
+            return None
+        for price_range in region_config.get("price_ranges", []):
+            if price_range.get("level") == price_level:
+                return price_range
+        return None
+
+    def _get_region_tier_target(self, region_type: str, price_level: str) -> int:
+        """Compute target hotel count for region-tier bucket."""
+        region_config = GUANGZHOU_REGIONS.get(region_type)
+        if not region_config:
+            return 0
+        zone_count = len(region_config.get("business_zones", []))
+        price_range = self._get_price_range_by_level(region_type, price_level)
+        if not price_range:
+            return 0
+        return int(price_range.get("top_n", 0)) * zone_count
+
+    def _get_tier_floor_ratio(self, price_level: str) -> float:
+        """Return floor ratio per price level."""
+        mapping = {
+            "经济型": settings.sampling_floor_ratio_economy,
+            "舒适型": settings.sampling_floor_ratio_comfort,
+            "高档型": settings.sampling_floor_ratio_high,
+            "奢华型": settings.sampling_floor_ratio_luxury,
+        }
+        ratio = float(mapping.get(price_level, settings.sampling_floor_ratio_high))
+        return max(0.0, min(ratio, 1.0))
+
+    def _get_region_tier_floor(self, region_type: str, price_level: str) -> int:
+        """Compute hard-floor count for region-tier bucket."""
+        target = self._get_region_tier_target(region_type, price_level)
+        if target <= 0:
+            return 0
+        ratio = self._get_tier_floor_ratio(price_level)
+        floor_count = int(math.ceil(target * ratio))
+        return max(0, min(floor_count, target))
+
+    def _record_sampling_audit(
+        self,
+        session,
+        hotel_data: dict,
+        sample_source: str,
+        min_review_count: int,
+        borrow_for_region: Optional[str] = None,
+    ) -> None:
+        """Persist per-hotel sampling source for auditability."""
+        _persistence_helpers().record_sampling_audit(
+            session=session,
+            hotel_data=hotel_data,
+            sample_source=sample_source,
+            min_review_count=min_review_count,
+            borrow_for_region=borrow_for_region,
+        )
+
+    def _crawl_region_tier_incremental(
+        self,
+        region_type: str,
+        price_level: str,
+        needed: int,
+        min_review_count: int,
+        sample_source: str,
+        borrow_for_region: Optional[str] = None,
+    ) -> list[dict]:
+        """Incrementally crawl additional hotels for one region-tier bucket."""
+        if needed <= 0:
+            return []
+
+        region_config = GUANGZHOU_REGIONS.get(region_type)
+        if not region_config:
+            return []
+
+        price_range = self._get_price_range_by_level(region_type, price_level)
+        if not price_range:
+            logger.warning(f"未找到价格档位配置: {region_type} - {price_level}")
+            return []
+
+        region_seen_ids = self._get_region_saved_hotel_ids(region_type)
+        collected: list[dict] = []
+        remaining = needed
+
+        for zone in region_config.get("business_zones", []):
+            if remaining <= 0:
+                break
+
+            zone_hotels = self.crawl_by_zone_and_price(
+                region_type=region_type,
+                business_zone=zone,
+                price_range=price_range,
+                target_count=remaining,
+                exclude_ids=region_seen_ids,
+                save_to_db=True,
+                min_review_count_override=min_review_count,
+                incremental_target=True,
+                sample_source=sample_source,
+                borrow_for_region=borrow_for_region,
+            )
+
+            for hotel in zone_hotels:
+                hotel_id = hotel.get("hotel_id")
+                if hotel_id:
+                    region_seen_ids.add(hotel_id)
+
+            collected.extend(zone_hotels)
+            remaining = max(remaining - len(zone_hotels), 0)
+
+        return collected
+
+    def _apply_region_floor_policy(self, region_type: str) -> list[dict]:
+        """Apply hard-floor and threshold relaxation within a region first."""
+        if not settings.sampling_policy_enabled:
+            return []
+
+        collected: list[dict] = []
+        threshold_steps = settings.sampling_threshold_steps
+
+        for price_level in settings.sampling_sparse_tier_levels:
+            target = self._get_region_tier_target(region_type, price_level)
+            floor_count = self._get_region_tier_floor(region_type, price_level)
+            if target <= 0 or floor_count <= 0:
+                continue
+
+            actual = self._count_region_tier_hotels(region_type, price_level)
+            if actual >= floor_count:
+                continue
+
+            deficit = floor_count - actual
+            logger.warning(
+                f"{region_type} - {price_level} 低于硬下限: "
+                f"当前{actual}/{floor_count}, 需要补齐{deficit}家"
+            )
+
+            for threshold in threshold_steps:
+                if deficit <= 0:
+                    break
+
+                sample_source = (
+                    "in_region"
+                    if threshold >= settings.min_reviews_threshold
+                    else "relaxed_threshold"
+                )
+                new_hotels = self._crawl_region_tier_incremental(
+                    region_type=region_type,
+                    price_level=price_level,
+                    needed=deficit,
+                    min_review_count=threshold,
+                    sample_source=sample_source,
+                )
+                collected.extend(new_hotels)
+
+                actual = self._count_region_tier_hotels(region_type, price_level)
+                deficit = max(floor_count - actual, 0)
+
+        return collected
+
+    def _apply_city_compensation_policy(self) -> list[dict]:
+        """Compensate sparse tier deficits with guarded cross-region borrowing."""
+        if not settings.sampling_policy_enabled or not settings.sampling_city_compensation_enabled:
+            return []
+
+        all_regions = list(GUANGZHOU_REGIONS.keys())
+        collected: list[dict] = []
+
+        for price_level in settings.sampling_sparse_tier_levels:
+            stats: dict[str, dict[str, int]] = {}
+            for region_type in all_regions:
+                target = self._get_region_tier_target(region_type, price_level)
+                floor_count = self._get_region_tier_floor(region_type, price_level)
+                actual = self._count_region_tier_hotels(region_type, price_level)
+                borrow_cap = int(math.floor(target * settings.sampling_borrow_cap_ratio))
+                donor_guard = int(math.ceil(target * settings.sampling_donor_guard_ratio))
+                deficit = max(target - actual, 0)
+                borrow_need = min(deficit, max(borrow_cap, 0))
+                donor_surplus = max(actual - floor_count - donor_guard, 0)
+
+                stats[region_type] = {
+                    "target": target,
+                    "actual": actual,
+                    "floor": floor_count,
+                    "borrow_need": borrow_need,
+                    "donor_surplus": donor_surplus,
+                }
+
+            total_need = sum(item["borrow_need"] for item in stats.values())
+            total_surplus = sum(item["donor_surplus"] for item in stats.values())
+            if total_need <= 0 or total_surplus <= 0:
+                continue
+
+            donor_out: dict[str, int] = defaultdict(int)
+            donor_receivers: dict[str, set[str]] = defaultdict(set)
+
+            receiver_order = sorted(
+                all_regions,
+                key=lambda region: stats[region]["borrow_need"],
+                reverse=True,
+            )
+
+            donor_order = sorted(
+                all_regions,
+                key=lambda region: stats[region]["donor_surplus"],
+                reverse=True,
+            )
+
+            for receiver in receiver_order:
+                need = stats[receiver]["borrow_need"]
+                if need <= 0:
+                    continue
+
+                for donor in donor_order:
+                    if donor == receiver:
+                        continue
+                    surplus = stats[donor]["donor_surplus"]
+                    if surplus <= 0 or need <= 0:
+                        continue
+
+                    take = min(need, surplus)
+                    stats[donor]["donor_surplus"] -= take
+                    need -= take
+                    donor_out[donor] += take
+                    donor_receivers[donor].add(receiver)
+
+            for donor_region, needed in donor_out.items():
+                remaining = needed
+                borrow_for_region = ",".join(sorted(donor_receivers[donor_region]))
+
+                for threshold in settings.sampling_threshold_steps:
+                    if remaining <= 0:
+                        break
+
+                    new_hotels = self._crawl_region_tier_incremental(
+                        region_type=donor_region,
+                        price_level=price_level,
+                        needed=remaining,
+                        min_review_count=threshold,
+                        sample_source="cross_region_borrow",
+                        borrow_for_region=borrow_for_region,
+                    )
+                    collected.extend(new_hotels)
+                    remaining = max(remaining - len(new_hotels), 0)
+
+                if remaining > 0:
+                    logger.warning(
+                        f"跨分区补偿不足: tier={price_level}, donor={donor_region}, "
+                        f"未完成{remaining}/{needed}家"
+                    )
+
+        return collected
+
     def extract_hotels_from_page(
         self,
         max_hotels: Optional[int] = None,
@@ -194,7 +444,7 @@ class HotelListCrawler:
         if min_review_count is None:
             min_review_count = settings.min_reviews_threshold
         current_page = 1
-        max_pages = 50  # search deeper before fallback
+        max_pages = 20  # 自定义最大连续搜索页数深度
         
         while True:
             # 等待页面完全加载
@@ -318,6 +568,8 @@ class HotelListCrawler:
                     # 如果达到最大数量，提前返回
                     if max_hotels and len(all_hotels) >= max_hotels:
                         logger.info(f"已达到目标数量 {max_hotels}，停止提取")
+                        if page_callback and page_hotels:
+                            page_callback(page_hotels, page_no)
                         return all_hotels
             else:
                 # 回退方案：从HTML中提取酒店ID，再逐个解析
@@ -352,6 +604,8 @@ class HotelListCrawler:
                             # 如果达到最大数量，提前返回
                             if max_hotels and len(all_hotels) >= max_hotels:
                                 logger.info(f"已达到目标数量 {max_hotels}，停止提取")
+                                if page_callback and page_hotels:
+                                    page_callback(page_hotels, page_no)
                                 return all_hotels
                     except Exception as e:
                         logger.debug(f"提取酒店 {hotel_id} 失败: {e}")
@@ -394,39 +648,7 @@ class HotelListCrawler:
 
     def _extract_json_blob(self, html: str, var_name: str) -> Optional[str]:
         """Extract a JSON object assigned to a JS variable from HTML."""
-        token = f"{var_name} ="
-        start_idx = html.find(token)
-        if start_idx == -1:
-            return None
-
-        brace_start = html.find("{", start_idx)
-        if brace_start == -1:
-            return None
-
-        depth = 0
-        in_string = False
-        escape = False
-
-        for i in range(brace_start, len(html)):
-            ch = html[i]
-            if in_string:
-                if escape:
-                    escape = False
-                elif ch == "\\":
-                    escape = True
-                elif ch == '"':
-                    in_string = False
-            else:
-                if ch == '"':
-                    in_string = True
-                elif ch == '{':
-                    depth += 1
-                elif ch == '}':
-                    depth -= 1
-                    if depth == 0:
-                        return html[brace_start:i + 1]
-
-        return None
+        return _query_data_helpers().extract_json_blob(html, var_name)
 
     def _map_price_level(self, base_price: Optional[int]) -> Optional[str]:
         """Map base price to configured price level."""
@@ -467,147 +689,15 @@ class HotelListCrawler:
 
     def _extract_hotels_from_query_data(self, html: str) -> list[dict]:
         """Extract hotel list from __QUERY_RESULT_DATA__ JSON in the page."""
-        blob = self._extract_json_blob(html, "__QUERY_RESULT_DATA__")
-        if not blob:
-            return []
-
-        try:
-            data = json.loads(blob)
-        except Exception as e:
-            logger.debug(f"query data json parse failed: {e}")
-            return []
-
-        hotel_list = data.get("hotelList") or []
-        if not isinstance(hotel_list, list):
-            return []
-
-        hotels: list[dict] = []
-
-        for item in hotel_list:
-            if not isinstance(item, dict):
-                continue
-
-            hotel_id = item.get("shid") or item.get("hotelId") or item.get("hotel_id")
-            if hotel_id is None:
-                continue
-            hotel_id = str(hotel_id)
-
-            name = item.get("name") or item.get("hotelName") or item.get("title")
-            if not name:
-                continue
-
-            name = normalize_hotel_name(clean_text(str(name)))
-            if not name:
-                continue
-
-            rating_score = None
-            rate_score_raw = item.get("rateScore")
-            if rate_score_raw is not None:
-                try:
-                    rating_score = float(rate_score_raw)
-                except Exception:
-                    rating_score = None
-
-            review_count = 0
-            rate_num_raw = item.get("rateNum")
-            if rate_num_raw is not None:
-                try:
-                    review_count = int(rate_num_raw)
-                except Exception:
-                    review_count = 0
-
-            base_price = None
-            price_disp = item.get("priceDesp")
-            if price_disp is not None:
-                base_price = extract_price(str(price_disp))
-
-            if base_price is None:
-                price_without_tax = item.get("priceWithoutTax") or {}
-                if isinstance(price_without_tax, dict):
-                    amount_cny = price_without_tax.get("amountCNY")
-                    if amount_cny is not None:
-                        try:
-                            base_price = int(amount_cny)
-                        except Exception:
-                            base_price = None
-
-            if base_price is None:
-                price_raw = item.get("price")
-                if price_raw is not None:
-                    try:
-                        price_raw = float(price_raw)
-                        base_price = int(price_raw / 100) if price_raw > 1000 else int(price_raw)
-                    except Exception:
-                        base_price = None
-
-            address = item.get("address")
-            if address:
-                address = clean_text(str(address))
-
-            star_level = None
-            level = item.get("level") or {}
-            if isinstance(level, dict):
-                star_level = level.get("desc") or level.get("starRate") or level.get("star")
-
-            latitude = None
-            longitude = None
-            lat_raw = item.get("lat")
-            lng_raw = item.get("lng")
-            try:
-                if lat_raw is not None:
-                    latitude = float(lat_raw)
-                if lng_raw is not None:
-                    longitude = float(lng_raw)
-            except Exception:
-                latitude = None
-                longitude = None
-
-            hotels.append({
-                "hotel_id": hotel_id,
-                "name": name,
-                "address": address,
-                "latitude": latitude,
-                "longitude": longitude,
-                "star_level": star_level,
-                "rating_score": rating_score,
-                "review_count": review_count,
-                "base_price": base_price,
-            })
-
-        return hotels
+        return _query_data_helpers().extract_hotels_from_query_data(html, logger=logger)
 
     def _get_query_page_info(self, html: str) -> Optional[dict]:
         """Get paging info from __QUERY_RESULT_DATA__."""
-        blob = self._extract_json_blob(html, "__QUERY_RESULT_DATA__")
-        if not blob:
-            return None
-
-        try:
-            data = json.loads(blob)
-        except Exception:
-            return None
-
-        query = data.get("query")
-        if not isinstance(query, dict):
-            return None
-
-        return {
-            "currentPage": query.get("currentPage"),
-            "totalPage": query.get("totalPage"),
-            "pageSize": query.get("pageSize"),
-            "offset": query.get("offset"),
-        }
+        return _query_data_helpers().extract_query_page_info(html)
 
     def _update_url_param(self, url: str, key: str, value: int) -> str:
         """Update/add a query param for pagination."""
-        if not url:
-            return url
-
-        parts = urlsplit(url)
-        query = parse_qs(parts.query, keep_blank_values=True)
-        query[key] = [str(value)]
-        new_query = urlencode(query, doseq=True)
-        return urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
+        return _pagination_helpers().update_url_param(url, key, value)
 
     def _extract_hotel_from_html(self, html: str, hotel_id: str) -> Optional[dict]:
         """从HTML源码中提取单个酒店的基本信息
@@ -984,6 +1074,10 @@ class HotelListCrawler:
         target_count: Optional[int] = None,
         exclude_ids: Optional[set[str]] = None,
         save_to_db: bool = True,
+        min_review_count_override: Optional[int] = None,
+        incremental_target: bool = False,
+        sample_source: str = "in_region",
+        borrow_for_region: Optional[str] = None,
     ) -> list[dict]:
         """按商圈和价格档次爬取酒店（支持翻页采集）
 
@@ -1000,16 +1094,31 @@ class HotelListCrawler:
         zone_code = business_zone['code']
         price_level = price_range['level']
         top_n = target_count if target_count is not None else price_range['top_n']
+        effective_min_review_count = (
+            min_review_count_override
+            if min_review_count_override is not None
+            else settings.min_reviews_threshold
+        )
 
-        logger.info(f"开始爬取: {region_type} - {zone_name} - {price_level} (目标: {top_n}家)")
+        mode_label = "增采" if incremental_target else "爬取"
+        logger.info(f"开始{mode_label}: {region_type} - {zone_name} - {price_level} (目标: {top_n}家)")
 
         saved_hotel_ids = self._get_saved_hotel_ids(region_type, zone_code, price_level) if save_to_db else set()
-        remaining_target = max(top_n - len(saved_hotel_ids), 0)
+        if incremental_target:
+            remaining_target = top_n
+        else:
+            remaining_target = max(top_n - len(saved_hotel_ids), 0)
         if saved_hotel_ids:
-            logger.info(
-                f"检测到已保存进度: {region_type} - {zone_name} - {price_level} "
-                f"已有{len(saved_hotel_ids)}家, 本次补采{remaining_target}家"
-            )
+            if incremental_target:
+                logger.info(
+                    f"检测到已保存样本: {region_type} - {zone_name} - {price_level} "
+                    f"已有{len(saved_hotel_ids)}家, 本次增采{remaining_target}家"
+                )
+            else:
+                logger.info(
+                    f"检测到已保存进度: {region_type} - {zone_name} - {price_level} "
+                    f"已有{len(saved_hotel_ids)}家, 本次补采{remaining_target}家"
+                )
         if remaining_target <= 0:
             logger.info(f"{region_type} - {zone_name} - {price_level} 已达到目标数量，跳过重爬")
             return []
@@ -1064,14 +1173,19 @@ class HotelListCrawler:
             if not prepared_hotels:
                 return
 
-            self._save_hotels(prepared_hotels)
+            self._save_hotels(
+                prepared_hotels,
+                min_review_count_override=effective_min_review_count,
+                sample_source=sample_source,
+                borrow_for_region=borrow_for_region,
+            )
             hotels.extend(prepared_hotels)
             self._update_position_context(saved_count=len(saved_hotel_ids) + len(hotels), current_page=page_no)
 
         raw_hotels = self.extract_hotels_from_page(
             max_hotels=remaining_target,
             exclude_ids=effective_exclude_ids,
-            min_review_count=settings.min_reviews_threshold,
+            min_review_count=effective_min_review_count,
             price_range=price_range,
             page_callback=persist_page_hotels if save_to_db else None,
         )
@@ -1085,7 +1199,14 @@ class HotelListCrawler:
                 price_range=price_range,
             )
 
-        logger.info(f"爬取完成: {len(saved_hotel_ids) + len(hotels)}/{top_n} 家酒店 (新增{len(hotels)}家)")
+        if incremental_target:
+            logger.info(
+                f"增采完成: {region_type} - {zone_name} - {price_level} "
+                f"新增{len(hotels)}/{top_n}家 (阈值>={effective_min_review_count})"
+            )
+        else:
+            actual_total = len(saved_hotel_ids) + len(hotels)
+            logger.info(f"爬取完成: {actual_total}/{top_n} 家酒店 (新增{len(hotels)}家)")
         self._clear_position_context()
         return hotels
 
@@ -1121,6 +1242,18 @@ class HotelListCrawler:
                     region_seen_ids.add(hotel_id)
             all_hotels.extend(zone_hotels)
 
+        if save_to_db and settings.sampling_policy_enabled:
+            adaptive_hotels = self._apply_region_floor_policy(region_type)
+            if adaptive_hotels:
+                logger.info(
+                    f"功能区 {region_type} 采样补偿新增 {len(adaptive_hotels)} 家酒店"
+                )
+                for hotel in adaptive_hotels:
+                    hotel_id = hotel.get('hotel_id')
+                    if hotel_id:
+                        region_seen_ids.add(hotel_id)
+                all_hotels.extend(adaptive_hotels)
+
         logger.info(f"功能区 {region_type} 爬取完成，共 {len(all_hotels)} 家酒店")
         return all_hotels
 
@@ -1143,6 +1276,7 @@ class HotelListCrawler:
         zone_seen_ids: set[str] = set(exclude_ids) if exclude_ids else set()
         remaining = zone_target_total
         carry_over = 0
+        exhausted_price_levels: set[str] = set()
 
         # 正向遍历价格档次，将缺口顺延到相邻更高价位
         for price_range in price_ranges:
@@ -1162,6 +1296,13 @@ class HotelListCrawler:
                 f"(基础{base_target} + 追加{carry_over} = {target})"
             )
 
+            existing_before_ids: set[str] = set()
+            if save_to_db:
+                existing_before_ids = self._get_saved_hotel_ids(region_type, zone_code, price_range['level'])
+                if existing_before_ids:
+                    zone_seen_ids.update(existing_before_ids)
+            existing_before_count = len(existing_before_ids)
+
             hotels = self.crawl_by_zone_and_price(
                 region_type=region_type,
                 business_zone=business_zone,
@@ -1178,9 +1319,30 @@ class HotelListCrawler:
 
             zone_hotels.extend(hotels)
 
-            actual = len(hotels)
-            remaining -= actual
-            carry_over = target - actual
+            if save_to_db:
+                existing_after_count = len(self._get_saved_hotel_ids(region_type, zone_code, price_range['level']))
+                actual = existing_after_count
+                new_added = max(existing_after_count - existing_before_count, 0)
+            else:
+                actual = len(hotels)
+                new_added = len(hotels)
+
+            achieved_for_target = min(target, actual)
+            remaining = max(remaining - achieved_for_target, 0)
+            carry_over = max(target - achieved_for_target, 0)
+
+            logger.info(
+                f"{zone_name} - {price_range['level']} 完成统计: "
+                f"已完成 {actual}/{target} 家, 本轮新增 {new_added} 家"
+            )
+
+            if save_to_db and target > 0 and new_added == 0:
+                exhausted_price_levels.add(price_range['level'])
+                logger.info(
+                    f"{zone_name} - {price_range['level']} 本轮无增量，标记为耗尽档位"
+                )
+            elif save_to_db and new_added > 0:
+                exhausted_price_levels.discard(price_range['level'])
 
             if carry_over > 0:
                 logger.warning(
@@ -1208,6 +1370,20 @@ class HotelListCrawler:
                     f"反向补位: {zone_name} - {price_range['level']} (目标: {target})"
                 )
 
+                if save_to_db and price_range['level'] in exhausted_price_levels:
+                    logger.info(
+                        f"反向补位跳过: {zone_name} - {price_range['level']} "
+                        f"(本轮已验证无增量，避免重复空转)"
+                    )
+                    continue
+
+                existing_before_ids: set[str] = set()
+                if save_to_db:
+                    existing_before_ids = self._get_saved_hotel_ids(region_type, zone_code, price_range['level'])
+                    if existing_before_ids:
+                        zone_seen_ids.update(existing_before_ids)
+                existing_before_count = len(existing_before_ids)
+
                 hotels = self.crawl_by_zone_and_price(
                     region_type=region_type,
                     business_zone=business_zone,
@@ -1223,8 +1399,25 @@ class HotelListCrawler:
 
                 zone_hotels.extend(hotels)
 
-                actual = len(hotels)
-                remaining -= actual
+                if save_to_db:
+                    existing_after_count = len(self._get_saved_hotel_ids(region_type, zone_code, price_range['level']))
+                    actual = existing_after_count
+                    new_added = max(existing_after_count - existing_before_count, 0)
+                else:
+                    actual = len(hotels)
+                    new_added = len(hotels)
+
+                # 反向补位是“补缺口”动作，remaining 仅按本轮新增贡献递减。
+                achieved_for_target = min(target, new_added)
+                remaining = max(remaining - achieved_for_target, 0)
+
+                logger.info(
+                    f"反向补位统计: {zone_name} - {price_range['level']} "
+                    f"已完成 {actual}/{target} 家, 本轮新增 {new_added} 家"
+                )
+
+                if save_to_db and target > 0 and new_added == 0:
+                    exhausted_price_levels.add(price_range['level'])
 
                 # 每次爬取后随机延迟
                 self.anti_crawler.random_delay(3, 6)
@@ -1235,8 +1428,17 @@ class HotelListCrawler:
                     f"可能需要调整筛选或增加页数"
                 )
 
+        if save_to_db:
+            zone_real_ids: set[str] = set()
+            for price_range in price_ranges:
+                zone_real_ids.update(
+                    self._get_saved_hotel_ids(region_type, zone_code, price_range['level'])
+                )
+            achieved_total = len(zone_real_ids)
+        else:
+            achieved_total = len(zone_hotels)
         logger.info(
-            f"商圈 {zone_name} 弹性补位完成，实际 {len(zone_hotels)}/{zone_target_total} 家"
+            f"商圈 {zone_name} 弹性补位完成，实际 {achieved_total}/{zone_target_total} 家"
         )
         return zone_hotels
 
@@ -1258,10 +1460,23 @@ class HotelListCrawler:
             # 功能区之间增加较长延迟
             self.anti_crawler.random_delay(5, 10)
 
+        if save_to_db and settings.sampling_policy_enabled and settings.sampling_city_compensation_enabled:
+            city_compensated_hotels = self._apply_city_compensation_policy()
+            if city_compensated_hotels:
+                all_hotels.extend(city_compensated_hotels)
+                logger.info(f"城市级跨分区补偿新增 {len(city_compensated_hotels)} 家酒店")
+
         logger.info(f"全部爬取完成，共 {len(all_hotels)} 家酒店")
         return all_hotels
 
-    def _save_hotels(self, hotels: list[dict], fetch_details: bool = False) -> int:
+    def _save_hotels(
+        self,
+        hotels: list[dict],
+        fetch_details: bool = False,
+        min_review_count_override: Optional[int] = None,
+        sample_source: str = "in_region",
+        borrow_for_region: Optional[str] = None,
+    ) -> int:
         """保存酒店到数据库（优化去重逻辑，避免跨商圈/价格档次的重复）
 
         Args:
@@ -1271,127 +1486,17 @@ class HotelListCrawler:
         Returns:
             成功保存的数量
         """
-        if not hotels:
-            return 0
-
-        min_review_count = settings.min_reviews_threshold
-        filtered_hotels = []
-        skipped_low_review = 0
-        if min_review_count:
-            for hotel in hotels:
-                review_count = hotel.get('review_count') or 0
-                try:
-                    review_count = int(review_count)
-                except Exception:
-                    review_count = 0
-                if review_count <= min_review_count:
-                    skipped_low_review += 1
-                    continue
-                filtered_hotels.append(hotel)
-            hotels = filtered_hotels
-
-        if not hotels:
-            if skipped_low_review:
-                logger.info(f"低评论酒店已过滤: {skipped_low_review} 家")
-            return 0
-
-        saved_count = 0
-        updated_count = 0
-        skipped_count = 0
-
-        with session_scope() as session:
-            # 批量查询已存在的酒店ID（减少数据库查询次数）
-            hotel_ids = [h['hotel_id'] for h in hotels if 'hotel_id' in h]
-            existing_hotels = session.query(Hotel).filter(
-                Hotel.hotel_id.in_(hotel_ids)
-            ).all()
-            
-            # 构建已存在酒店的字典，包含商圈和价格档次信息
-            # 格式: {hotel_id: {(business_zone_code, price_level): Hotel对象}}
-            existing_dict = {}
-            for h in existing_hotels:
-                if h.hotel_id not in existing_dict:
-                    existing_dict[h.hotel_id] = {}
-                key = (h.business_zone_code, h.price_level)
-                existing_dict[h.hotel_id][key] = h
-            
-            logger.debug(f"批量查询: {len(hotel_ids)}个酒店ID, 已存在{len(existing_hotels)}条记录")
-
-            for hotel_data in hotels:
-                try:
-                    hotel_id = hotel_data.get('hotel_id')
-                    if hotel_id is None:
-                        logger.debug("跳过缺少 hotel_id 的酒店详情获取")
-                        continue
-                    business_zone_code = hotel_data.get('business_zone_code')
-                    price_level = hotel_data.get('price_level')
-                    
-                    # 检查是否存在相同商圈和价格档次的记录
-                    key = (business_zone_code, price_level)
-                    is_duplicate = (
-                        hotel_id in existing_dict and
-                        key in existing_dict[hotel_id]
-                    )
-                    
-                    if is_duplicate:
-                        # 同一酒店在同一商圈和价格档次下已存在，跳过
-                        skipped_count += 1
-                        logger.debug(f"跳过重复酒店: {hotel_data.get('name')} (商圈:{business_zone_code}, 价格档次:{price_level})")
-                        continue
-                    
-                    # 如果是新酒店且需要获取详情
-                    if fetch_details and hotel_id not in existing_dict:
-                        logger.info(f"获取酒店 {hotel_id} 的详细信息...")
-                        details = self.fetch_hotel_details(str(hotel_id))
-                        
-                        if details:
-                            # 合并详细信息
-                            hotel_data.update(details)
-                            logger.debug(f"成功获取详细信息，更新了 {len(details)} 个字段")
-                        
-                        # 每次详情请求后延迟，避免请求过快
-                        self.anti_crawler.random_delay(2, 4)
-                    
-                    # 验证数据
-                    mapped_level = self._map_price_level(hotel_data.get('base_price'))
-                    if mapped_level:
-                        hotel_data['price_level'] = mapped_level
-
-                    validated = HotelModel(**hotel_data)
-
-                    # 检查是否存在该酒店ID的任何记录
-                    if hotel_id in existing_dict:
-                        # 酒店已存在但在不同的商圈或价格档次，更新基本信息但保留分层信息
-                        # 获取第一个已存在的记录用于更新基本信息
-                        first_existing = list(existing_dict[hotel_id].values())[0]
-                        
-                        # 只更新基本信息字段（不更新分层信息）
-                        basic_fields = ['name', 'address', 'latitude', 'longitude',
-                                       'star_level', 'rating_score', 'review_count', 'base_price']
-                        for field in basic_fields:
-                            value = validated.model_dump().get(field)
-                            if value is not None:
-                                setattr(first_existing, field, value)
-
-                        if mapped_level:
-                            first_existing.price_level = mapped_level
-                        
-                        updated_count += 1
-                        logger.debug(f"更新酒店基本信息: {validated.name}")
-                    else:
-                        # 创建新记录
-                        hotel = Hotel(**validated.model_dump())
-                        session.add(hotel)
-                        saved_count += 1
-                        logger.debug(f"新增酒店: {validated.name} (商圈:{business_zone_code}, 价格档次:{price_level})")
-
-                except Exception as e:
-                    logger.warning(f"保存酒店失败: {e}")
-                    continue
-
-        total = saved_count + updated_count
-        logger.info(f"保存完成: 新增{saved_count}家, 更新{updated_count}家, 跳过{skipped_count}家, 共处理{total}家")
-        return total
+        return _persistence_helpers().save_hotels(
+            hotels=hotels,
+            fetch_details=fetch_details,
+            min_review_count_override=min_review_count_override,
+            sample_source=sample_source,
+            borrow_for_region=borrow_for_region,
+            logger=logger,
+            fetch_hotel_details=lambda hotel_id: self.fetch_hotel_details(hotel_id),
+            random_delay=lambda min_delay, max_delay: self.anti_crawler.random_delay(min_delay, max_delay),
+            map_price_level=lambda base_price: self._map_price_level(base_price),
+        )
 
     def enrich_hotel_details(self, hotel_ids: Optional[list[str]] = None) -> int:
         """补充酒店的详细信息
@@ -1463,10 +1568,36 @@ class HotelListCrawler:
             Hotel对象
         """
         with session_scope() as session:
-            hotels = session.query(Hotel).filter(
-                Hotel.review_count >= settings.min_reviews_threshold
-            ).all()
+            hotels = session.query(Hotel).all()
 
+            sparse_tiers = set(settings.sampling_sparse_tier_levels) if settings.sampling_policy_enabled else set()
+            relaxed_min = min(settings.sampling_threshold_steps) if settings.sampling_policy_enabled else settings.min_reviews_threshold
+
+            filtered_hotels = []
             for hotel in hotels:
+                review_count_raw = getattr(hotel, "review_count", 0)
+                try:
+                    if review_count_raw is None:
+                        review_count = 0
+                    else:
+                        review_count = int(review_count_raw)
+                except Exception:
+                    review_count = 0
+
+                price_level_raw = getattr(hotel, "price_level", "")
+                price_level = "" if price_level_raw is None else str(price_level_raw)
+
+                if review_count > settings.min_reviews_threshold:
+                    filtered_hotels.append(hotel)
+                    continue
+
+                if (
+                    settings.sampling_policy_enabled
+                    and price_level in sparse_tiers
+                    and review_count > relaxed_min
+                ):
+                    filtered_hotels.append(hotel)
+
+            for hotel in filtered_hotels:
                 yield hotel
 
