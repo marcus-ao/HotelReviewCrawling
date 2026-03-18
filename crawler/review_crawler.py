@@ -140,6 +140,8 @@ class ReviewCrawler:
         self._jsonp_punished_scores: set[int] = set()
         self.last_crawl_summary: dict[str, Any] = {}
         self._quality_pool_stats: dict[str, dict[str, Any]] = {}
+        self._manual_takeover_count = 0
+        self._manual_timeout_reminder_count = 0
 
     def _update_review_context(self, **kwargs: object) -> None:
         """更新评论采集上下文，便于统一输出更清晰的日志。"""
@@ -316,9 +318,41 @@ class ReviewCrawler:
         }
         summary.update(self._summarize_review_mix(reviews))
         quality_totals = self._combine_quality_pool_stats()
+        if int(quality_totals.get("accepted_total", 0) or 0) <= 0:
+            quality_totals = {
+                **quality_totals,
+                **self._summarize_quality_from_reviews(reviews),
+            }
         summary.update(quality_totals)
+        summary["manual_takeover_count"] = int(self._manual_takeover_count)
+        summary["manual_timeout_reminder_count"] = int(self._manual_timeout_reminder_count)
         self.last_crawl_summary = summary
         return summary
+
+    def _summarize_quality_from_reviews(self, reviews: list[dict[str, Any]]) -> dict[str, Any]:
+        """直接从评论集合汇总质量统计，供断点恢复/补齐报表使用。"""
+        normalized_reviews = [self._ensure_review_quality_metadata(item) for item in reviews]
+        accepted_total = len(normalized_reviews)
+        high_quality_count = len(
+            [item for item in normalized_reviews if str(item.get("quality_tier") or "") in {"S", "A", "B"}]
+        )
+        short_comment_count = len(
+            [
+                item for item in normalized_reviews
+                if item.get("quality_tier") == "C" or bool(item.get("is_specific_short"))
+            ]
+        )
+        specific_short_count = len([item for item in normalized_reviews if bool(item.get("is_specific_short"))])
+        return {
+            "candidate_total": accepted_total,
+            "accepted_total": accepted_total,
+            "filtered_quality_total": 0,
+            "high_quality_count": high_quality_count,
+            "short_comment_count": short_comment_count,
+            "specific_short_count": specific_short_count,
+            "short_comment_ratio": round(short_comment_count / accepted_total, 4) if accepted_total else 0.0,
+            "high_quality_ratio": round(high_quality_count / accepted_total, 4) if accepted_total else 0.0,
+        }
 
     def _combine_quality_pool_stats(self) -> dict[str, Any]:
         """汇总正负评论池的质量统计。"""
@@ -417,6 +451,7 @@ class ReviewCrawler:
         specific_hits = self._keyword_hits(combined_text, self.SPECIFIC_SHORT_TRIGGER_KEYWORDS)
         is_specific_short = (
             effective_length >= 6
+            and effective_length < tier_b_min_len
             and aspect_hit_count >= 1
             and bool(specific_hits)
         )
@@ -437,6 +472,26 @@ class ReviewCrawler:
             "aspect_hits": aspect_hits[:5],
             "specific_hits": specific_hits[:5],
         }
+
+    def _ensure_review_quality_metadata(
+        self,
+        review: dict[str, Any],
+        fallback_source_pool: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """确保评论包含质量元数据；缺失时按当前规则补齐。"""
+        normalized_review = dict(review)
+        if "effective_length" in normalized_review and "quality_tier" in normalized_review:
+            return normalized_review
+
+        source_pool = str(normalized_review.get("source_pool") or fallback_source_pool or "")
+        normalized_review.update(
+            self._build_review_quality_metadata(
+                content=str(normalized_review.get("content") or ""),
+                summary=normalized_review.get("summary"),
+                source_pool=source_pool,
+            )
+        )
+        return normalized_review
 
     @staticmethod
     def _hotel_quality_bucket(review_count: Optional[int]) -> str:
@@ -537,15 +592,7 @@ class ReviewCrawler:
         specific_short: list[dict[str, Any]] = []
 
         for review in reviews:
-            normalized_review = dict(review)
-            if "effective_length" not in normalized_review or "quality_tier" not in normalized_review:
-                normalized_review.update(
-                    self._build_review_quality_metadata(
-                        content=str(normalized_review.get("content") or ""),
-                        summary=normalized_review.get("summary"),
-                        source_pool=str(normalized_review.get("source_pool") or source_pool),
-                    )
-                )
+            normalized_review = self._ensure_review_quality_metadata(review, source_pool)
             quality_tier = str(normalized_review.get("quality_tier") or "D")
             is_specific_short = bool(normalized_review.get("is_specific_short"))
             is_generic_short = bool(normalized_review.get("is_generic_short"))
@@ -589,15 +636,16 @@ class ReviewCrawler:
                 current_specific_short_count += 1
 
         if len(accepted) < int(math.ceil(target_count * relax_trigger)):
-            quality_relaxed_used = True
+            relaxed_before = len(accepted)
             for review in c_tier:
                 if len(accepted) >= target_count or current_short_count >= short_cap:
                     break
                 accepted.append(self._clone_review_with_reason(review, "tier_c_relaxed"))
                 current_short_count += 1
+            quality_relaxed_used = len(accepted) > relaxed_before
 
         if len(accepted) < target_count:
-            quality_fallback_used = True
+            fallback_before = len(accepted)
             for review in specific_short:
                 effective_length = int(review.get("effective_length", 0) or 0)
                 if len(accepted) >= target_count:
@@ -616,6 +664,7 @@ class ReviewCrawler:
                 accepted.append(self._clone_review_with_reason(review, "specific_short_fallback"))
                 current_short_count += 1
                 current_specific_short_count += 1
+            quality_fallback_used = len(accepted) > fallback_before
 
         accepted_reviews = accepted[:target_count]
         accepted_total = len(accepted_reviews)
@@ -1109,6 +1158,66 @@ class ReviewCrawler:
 
         return True, next_state, "ok"
 
+    def _prepare_manual_positive_takeover(
+        self,
+        hotel_id: str,
+        page_no: int,
+        current_count: int,
+        target_count: int,
+    ) -> None:
+        """人工接管前先把页面滚到底部并预留点击“下一页”的时间。"""
+        page = self.anti_crawler.get_page()
+        progress = f"{current_count}/{target_count}"
+        self.anti_crawler.ensure_page_foreground("positive_manual_takeover")
+        try:
+            self.anti_crawler.scroll_to_bottom(step=700, max_scrolls=24)
+        except Exception as exc:
+            logger.debug(f"人工正向接管预滚动失败: hotel_id={hotel_id}, page_no={page_no}, error={exc}")
+        try:
+            self._scroll_positive_pagination_into_view(page, hotel_id, page_no, progress)
+        except Exception as exc:
+            logger.debug(f"人工正向接管预定位分页区失败: hotel_id={hotel_id}, page_no={page_no}, error={exc}")
+
+        prewait_seconds = float(getattr(settings, "review_positive_manual_prewait_seconds", 10.0))
+        if prewait_seconds > 0:
+            logger.info(
+                f"人工正向接管预等待: hotel_id={hotel_id}, page_no={page_no}, "
+                f"progress={progress}, seconds={prewait_seconds:.1f}"
+            )
+            time.sleep(prewait_seconds)
+
+    def _input_with_timeout_reminder(
+        self,
+        *,
+        prompt: str,
+        reminder_seconds: float,
+        reminder_message: str,
+    ) -> str:
+        """带超时提醒的输入等待；超时只提醒，不自动跳过。"""
+        if reminder_seconds <= 0:
+            return input(prompt)
+
+        result: dict[str, Any] = {}
+
+        def _reader() -> None:
+            try:
+                result["value"] = input(prompt)
+            except BaseException as exc:  # pragma: no cover - 防御性分支
+                result["error"] = exc
+
+        reader = threading.Thread(target=_reader, daemon=True)
+        reader.start()
+
+        while reader.is_alive():
+            reader.join(timeout=reminder_seconds)
+            if reader.is_alive():
+                self._manual_timeout_reminder_count += 1
+                logger.warning(reminder_message)
+
+        if "error" in result:
+            raise result["error"]
+        return str(result.get("value") or "")
+
     def _request_manual_positive_takeover(
         self,
         hotel_id: str,
@@ -1118,11 +1227,22 @@ class ReviewCrawler:
         current_state: dict[str, Any],
     ) -> Optional[str]:
         """自动翻页失败时，请求人工介入。返回 quit/retry/continue。"""
+        self._manual_takeover_count += 1
+        self._prepare_manual_positive_takeover(hotel_id, page_no, current_count, target_count)
+        reminder_seconds = float(getattr(settings, "review_positive_manual_reminder_seconds", 90.0))
         while True:
             logger.info(
                 f"人工正向采集状态栏: {self._build_manual_positive_status_line(page_no=page_no, current_state=current_state, total_count=current_count)}"
             )
-            user_input = input(self._build_manual_positive_prompt(page_no, current_count, target_count)).strip().lower()
+            reminder_message = (
+                f"[positive][等待人工翻页] hotel_id={hotel_id}, page_no={page_no}, "
+                f"progress={current_count}/{target_count}，请确认是否已点击“下一页”或是否仍停留在旧页。"
+            )
+            user_input = self._input_with_timeout_reminder(
+                prompt=self._build_manual_positive_prompt(page_no, current_count, target_count),
+                reminder_seconds=reminder_seconds,
+                reminder_message=reminder_message,
+            ).strip().lower()
             if user_input in {"i", "info", "?", "help"}:
                 current_state = self._get_manual_page_state(hotel_id)
                 self._log_manual_positive_page_state(hotel_id, page_no, current_state)
@@ -3325,6 +3445,8 @@ class ReviewCrawler:
         self._jsonp_punished_scores.clear()
         self.last_crawl_summary = {}
         self._quality_pool_stats = {}
+        self._manual_takeover_count = 0
+        self._manual_timeout_reminder_count = 0
         checkpoint = self._load_review_checkpoint(hotel_id)
 
         hotel_review_count = self._get_hotel_review_count_from_db(hotel_id)
@@ -3345,15 +3467,24 @@ class ReviewCrawler:
             )
 
         if save_to_db:
-            existing_reviews = self._load_existing_reviews_from_db(hotel_id)
+            existing_reviews = [
+                self._ensure_review_quality_metadata(item)
+                for item in self._load_existing_reviews_from_db(hotel_id)
+            ]
             all_reviews.extend(existing_reviews)
             for item in existing_reviews:
                 review_id = item.get("review_id")
                 if review_id:
                     self.crawled_review_ids.add(review_id)
 
-        if len(all_reviews) >= target_total:
-            final_reviews = all_reviews[:target_total]
+        existing_negative = len(
+            [item for item in all_reviews if str(item.get("source_pool") or "").lower() == "negative"]
+        )
+        existing_positive = len(
+            [item for item in all_reviews if str(item.get("source_pool") or "").lower() == "positive"]
+        )
+        if existing_negative >= target_negative and existing_positive >= target_positive:
+            final_reviews = list(all_reviews)
             self._record_last_crawl_summary(
                 hotel_id,
                 review_count=hotel_review_count,
@@ -3362,9 +3493,17 @@ class ReviewCrawler:
                 target_positive=target_positive,
                 reviews=final_reviews,
             )
+            self.last_crawl_summary.update(
+                {
+                    "skipped_negative_pool": True,
+                    "skipped_positive_pool": True,
+                    "remaining_negative_to_fill": 0,
+                    "remaining_positive_to_fill": 0,
+                }
+            )
             logger.info(
-                f"酒店 {hotel_id} 已有评论数达到/超过总配额，跳过继续采集: "
-                f"existing={len(all_reviews)}, cap={target_total}"
+                f"酒店 {hotel_id} 两池均已达标，跳过继续采集: "
+                f"negative={existing_negative}/{target_negative}, positive={existing_positive}/{target_positive}"
             )
             self._clear_review_checkpoint(hotel_id)
             self._clear_review_context()
@@ -3380,7 +3519,7 @@ class ReviewCrawler:
             logger.warning(f"无法获取酒店 {hotel_id} 的评论数")
         elif total_count <= 0:
             logger.info(f"酒店 {hotel_id} 无可采集评论，跳过")
-            final_reviews = all_reviews[:target_total]
+            final_reviews = list(all_reviews)
             self._record_last_crawl_summary(
                 hotel_id,
                 review_count=hotel_review_count,
@@ -3388,6 +3527,14 @@ class ReviewCrawler:
                 target_negative=target_negative,
                 target_positive=target_positive,
                 reviews=final_reviews,
+            )
+            self.last_crawl_summary.update(
+                {
+                    "skipped_negative_pool": existing_negative >= target_negative,
+                    "skipped_positive_pool": existing_positive >= target_positive,
+                    "remaining_negative_to_fill": max(target_negative - existing_negative, 0),
+                    "remaining_positive_to_fill": max(target_positive - existing_positive, 0),
+                }
             )
             self._clear_review_checkpoint(hotel_id)
             self._clear_review_context()
@@ -3441,8 +3588,10 @@ class ReviewCrawler:
 
         # 步骤1: 负面警示池（差评）
         negative_target = min(target_negative, target_total)
-        negative_existing = len([item for item in all_reviews if item.get("source_pool") == "negative"])
-        total_remaining_quota = max(target_total - len(all_reviews), 0)
+        negative_existing = len(
+            [item for item in all_reviews if str(item.get("source_pool") or "").lower() == "negative"]
+        )
+        total_remaining_quota = max(negative_target - negative_existing, 0)
         logger.info("步骤1: 爬取负面警示池")
         try:
             remaining_negative = max(
@@ -3451,7 +3600,7 @@ class ReviewCrawler:
             )
             if remaining_negative <= 0:
                 logger.info(
-                    f"负面池已由历史数据/断点补足或总配额已满，跳过继续采集: "
+                    f"负面池已由历史数据/断点补足，跳过继续采集: "
                     f"hotel_id={hotel_id}, negative_existing={negative_existing}, total_remaining={total_remaining_quota}"
                 )
             else:
@@ -3484,15 +3633,18 @@ class ReviewCrawler:
 
         current_mix = self._summarize_review_mix(all_reviews)
         actual_negative = int(current_mix["actual_negative"])
+        actual_positive = int(current_mix["actual_positive"])
         if actual_negative < target_negative:
             logger.info(
                 f"负评软目标未达成但接受短缺: hotel_id={hotel_id}, "
                 f"target_negative={target_negative}, actual_negative={actual_negative}"
             )
 
-        if len(all_reviews) >= target_total:
+        remaining_positive = max(target_positive - actual_positive, 0)
+
+        if remaining_positive <= 0:
             self._clear_review_checkpoint(hotel_id)
-            final_reviews = all_reviews[:target_total]
+            final_reviews = list(all_reviews)
             self._record_last_crawl_summary(
                 hotel_id,
                 review_count=hotel_review_count,
@@ -3501,14 +3653,21 @@ class ReviewCrawler:
                 target_positive=target_positive,
                 reviews=final_reviews,
             )
+            self.last_crawl_summary.update(
+                {
+                    "skipped_negative_pool": negative_existing >= target_negative,
+                    "skipped_positive_pool": True,
+                    "remaining_negative_to_fill": max(target_negative - actual_negative, 0),
+                    "remaining_positive_to_fill": 0,
+                }
+            )
             return final_reviews
 
-        remaining = max(target_total - len(all_reviews), 0)
         logger.info(
-            f"步骤2: 采集正向评论，剩余总配额 {remaining}, target_positive={target_positive}, "
+            f"步骤2: 采集正向评论，剩余正评配额 {remaining_positive}, target_positive={target_positive}, "
             f"actual_negative={actual_negative}"
         )
-        if remaining > 0:
+        if remaining_positive > 0:
             if not self.positive_manual:
                 logger.info("正向人工辅助采集已关闭，跳过正向评论池")
             else:
@@ -3516,7 +3675,7 @@ class ReviewCrawler:
                 try:
                     positive_reviews = self._crawl_positive_pool_manual(
                         hotel_id=hotel_id,
-                        max_count=remaining,
+                        max_count=remaining_positive,
                         save_to_db=save_to_db,
                     )
                     all_reviews.extend(positive_reviews)
@@ -3556,7 +3715,7 @@ class ReviewCrawler:
                         )
                     raise
 
-        final_reviews = all_reviews[:target_total]
+        final_reviews = list(all_reviews)
         summary = self._record_last_crawl_summary(
             hotel_id,
             review_count=hotel_review_count,
@@ -3564,6 +3723,14 @@ class ReviewCrawler:
             target_negative=target_negative,
             target_positive=target_positive,
             reviews=final_reviews,
+        )
+        summary.update(
+            {
+                "skipped_negative_pool": negative_existing >= target_negative,
+                "skipped_positive_pool": (remaining_positive <= 0) or (not self.positive_manual and remaining_positive > 0),
+                "remaining_negative_to_fill": max(target_negative - summary["actual_negative"], 0),
+                "remaining_positive_to_fill": max(target_positive - summary["actual_positive"], 0),
+            }
         )
         logger.info(
             f"酒店 {hotel_id} 采集完成，共 {len(final_reviews)} 条评论，"

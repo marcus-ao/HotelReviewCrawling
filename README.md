@@ -181,8 +181,11 @@ python main.py --mode reviews --hotel-id 10019773 --negative-only
 # 明确启用正向人工辅助模式
 python main.py --mode reviews --hotel-id 10019773 --positive-manual
 
-# 爬取所有酒店的负向评论
+# 爬取所有酒店评论（默认：负向自动 + 正向半自动）
 python main.py --mode reviews --all
+
+# 批量模式下仅爬取所有酒店的负向评论
+python main.py --mode reviews --all --negative-only
 ```
 
 正向人工辅助模式说明：
@@ -230,7 +233,8 @@ python main.py --help
 
 说明：
 - 单酒店默认启用 `positive` 人工辅助模式
-- 批量 `--all` 默认只跑 `negative`
+- 批量 `--all` 默认执行“负评自动 + 正评半自动”的完整流程
+- 若只想无人值守批量跑负评，可使用 `--negative-only`
 - 单酒店总评论目标不再固定为 300，而是根据 `review_count` 动态计算
 - 评论会先做信息量分层：优先保留中长、高信息评论；数量不足时再按酒店评论量分档动态放宽
 - 评论数少于阈值的酒店仍会被记录告警，但不强制跳过
@@ -257,6 +261,9 @@ python main.py --help
 | `REVIEW_NEGATIVE_MIN_EFFECTIVE_LEN` | 负评默认最低有效长度 | 负评更严格 | 更容易保留短问题评论 |
 | `REVIEW_SHORT_COMMENT_MAX_RATIO_HIGH/MID/LOW` | 各评论量档位短评占比上限 | 更容易放宽短评 | 更强调中长评论 |
 | `REVIEW_QUALITY_RELAX_TRIGGER_RATIO` | 进入放宽阶段的触发阈值 | 更早放宽，覆盖更全 | 更晚放宽，质量更高 |
+| `REVIEW_BATCH_ALL_WITH_POSITIVE_DEFAULT` | 批量 `--all` 默认是否跑完整全流程 | 更接近人工全量采集 | 更适合无人值守只跑负评 |
+| `REVIEW_POSITIVE_MANUAL_PREWAIT_SECONDS` | 人工接管前的预等待秒数 | 更从容点击“下一页” | 整批节奏更快 |
+| `REVIEW_POSITIVE_MANUAL_REMINDER_SECONDS` | 人工提示后的提醒间隔 | 终端更安静 | 提醒更频繁、不易遗忘 |
 
 经验建议：
 - 如果知识库里“空泛好评”过多，优先提高 `REVIEW_POSITIVE_MIN_EFFECTIVE_LEN`

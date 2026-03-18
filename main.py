@@ -262,11 +262,15 @@ def crawl_reviews(
     should_close = True
     resolved_positive_manual = (
         False
-        if all_hotels and positive_manual is None
+        if positive_manual is False
         else (
-            getattr(settings, "review_positive_manual_default_enabled", True)
-            if positive_manual is None
-            else positive_manual
+            getattr(settings, "review_batch_all_with_positive_default", True)
+            if all_hotels and positive_manual is None
+            else (
+                getattr(settings, "review_positive_manual_default_enabled", True)
+                if positive_manual is None
+                else positive_manual
+            )
         )
     )
     crawler = ReviewCrawler(anti_crawler, positive_manual=resolved_positive_manual)
@@ -328,6 +332,12 @@ def crawl_reviews(
                                     "high_quality_ratio": 0.0,
                                     "quality_relaxed_used": False,
                                     "quality_fallback_used": False,
+                                    "skipped_negative_pool": False,
+                                    "skipped_positive_pool": False,
+                                    "remaining_negative_to_fill": 0,
+                                    "remaining_positive_to_fill": 0,
+                                    "manual_takeover_count": 0,
+                                    "manual_timeout_reminder_count": 0,
                                 }
                             hotel_summaries.append(crawl_summary)
                             if reviews:
@@ -388,6 +398,24 @@ def crawl_reviews(
                     quality_fallback_hotels = sum(
                         1 for item in hotel_summaries if bool(item.get("quality_fallback_used"))
                     )
+                    skipped_hotels_all_targets_met = sum(
+                        1
+                        for item in hotel_summaries
+                        if bool(item.get("skipped_negative_pool")) and bool(item.get("skipped_positive_pool"))
+                    )
+                    negative_pool_hotels_processed = sum(
+                        1 for item in hotel_summaries if not bool(item.get("skipped_negative_pool"))
+                    )
+                    positive_pool_hotels_processed = sum(
+                        1 for item in hotel_summaries if not bool(item.get("skipped_positive_pool"))
+                    )
+                    positive_pool_hotels_skipped = sum(
+                        1 for item in hotel_summaries if bool(item.get("skipped_positive_pool"))
+                    )
+                    manual_takeover_count = sum(int(item.get("manual_takeover_count", 0) or 0) for item in hotel_summaries)
+                    manual_timeout_reminder_count = sum(
+                        int(item.get("manual_timeout_reminder_count", 0) or 0) for item in hotel_summaries
+                    )
 
                     batch_report = {
                         "generated_at": datetime.now().isoformat(timespec="seconds"),
@@ -412,6 +440,12 @@ def crawl_reviews(
                             "short_comment_ratio": short_comment_ratio,
                             "quality_relaxed_hotels": quality_relaxed_hotels,
                             "quality_fallback_hotels": quality_fallback_hotels,
+                            "skipped_hotels_all_targets_met": skipped_hotels_all_targets_met,
+                            "negative_pool_hotels_processed": negative_pool_hotels_processed,
+                            "positive_pool_hotels_processed": positive_pool_hotels_processed,
+                            "positive_pool_hotels_skipped": positive_pool_hotels_skipped,
+                            "manual_takeover_count": manual_takeover_count,
+                            "manual_timeout_reminder_count": manual_timeout_reminder_count,
                         },
                         "hotels": hotel_summaries,
                     }
@@ -422,7 +456,8 @@ def crawl_reviews(
                         f"skipped={skipped}, failed={failed}, "
                         f"negative={total_negative}, positive={total_positive}, "
                         f"negative_ratio={negative_ratio:.2%}, high_quality_ratio={high_quality_ratio:.2%}, "
-                        f"short_comment_ratio={short_comment_ratio:.2%}, report={report_path}"
+                        f"short_comment_ratio={short_comment_ratio:.2%}, manual_takeover_count={manual_takeover_count}, "
+                        f"manual_timeout_reminder_count={manual_timeout_reminder_count}, report={report_path}"
                     )
 
                 else:
@@ -468,7 +503,8 @@ def main():
   python main.py --mode hotel_list --all              # 爬取所有功能区
   python main.py --mode reviews --hotel-id 10019773   # 负向自动 + 正向人工辅助
   python main.py --mode reviews --hotel-id 10019773 --negative-only  # 仅负向自动采集
-  python main.py --mode reviews --all                 # 批量酒店负向自动采集
+  python main.py --mode reviews --all                 # 批量酒店全流程采集(负向自动 + 正向半自动)
+  python main.py --mode reviews --all --negative-only # 批量酒店仅采集负向评论
         """
     )
 
@@ -493,7 +529,7 @@ def main():
     parser.add_argument(
         "--positive-manual",
         action="store_true",
-        help="启用正向评论人工辅助采集模式（单酒店时会提示手工翻页）",
+        help="启用正向评论人工辅助采集模式（单酒店显式启用；批量模式可用于强制开启）",
     )
     parser.add_argument(
         "--negative-only",
@@ -504,7 +540,7 @@ def main():
     parser.add_argument(
         "--all",
         action="store_true",
-        help="爬取所有 (功能区或酒店)"
+        help="爬取所有 (功能区或酒店；reviews 模式下默认执行批量全流程评论采集)"
     )
 
     args = parser.parse_args()

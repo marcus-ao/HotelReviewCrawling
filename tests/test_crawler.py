@@ -462,6 +462,7 @@ class TestReviewCrawler:
         from crawler.review_crawler import ReviewCrawler
 
         crawler = ReviewCrawler(anti_crawler=Mock(), positive_manual=True)
+        crawler._prepare_manual_positive_takeover = Mock()
         crawler._get_manual_page_state = Mock(
             side_effect=[
                 {"signature": ("p1",), "filter_text": "好评", "js_count": 15, "preview_items": []},
@@ -470,17 +471,39 @@ class TestReviewCrawler:
         )
         crawler._log_manual_positive_page_state = Mock()
 
-        with patch("builtins.input", side_effect=["i", "q"]):
+        crawler._input_with_timeout_reminder = Mock(side_effect=["i", "q"])
+        action = crawler._request_manual_positive_takeover(
+            hotel_id="10001",
+            page_no=2,
+            current_count=15,
+            target_count=50,
+            current_state={"signature": ("p1",), "filter_text": "好评", "js_count": 15, "preview_items": []},
+        )
+
+        assert action == "quit"
+        crawler._prepare_manual_positive_takeover.assert_called_once()
+        assert crawler._log_manual_positive_page_state.call_count >= 1
+
+    def test_request_manual_positive_takeover_counts_reminders_and_uses_timeout_wrapper(self):
+        from crawler.review_crawler import ReviewCrawler
+
+        crawler = ReviewCrawler(anti_crawler=Mock(), positive_manual=True)
+        crawler._prepare_manual_positive_takeover = Mock()
+        crawler._input_with_timeout_reminder = Mock(return_value="q")
+
+        with patch("crawler.review_crawler.settings", Mock(review_positive_manual_reminder_seconds=90.0)):
             action = crawler._request_manual_positive_takeover(
                 hotel_id="10001",
-                page_no=2,
-                current_count=15,
-                target_count=50,
+                page_no=3,
+                current_count=10,
+                target_count=40,
                 current_state={"signature": ("p1",), "filter_text": "好评", "js_count": 15, "preview_items": []},
             )
 
         assert action == "quit"
-        assert crawler._log_manual_positive_page_state.call_count >= 1
+        assert crawler._manual_takeover_count == 1
+        crawler._prepare_manual_positive_takeover.assert_called_once()
+        crawler._input_with_timeout_reminder.assert_called_once()
 
     def test_describe_manual_page_transition_contains_before_after(self):
         """人工翻页差异描述应包含前后摘要。"""

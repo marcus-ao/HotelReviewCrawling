@@ -117,6 +117,21 @@ class Settings(BaseSettings):
         default=20,
         alias="REVIEW_POSITIVE_MANUAL_PAGE_LIMIT",
     )
+    # 批量 reviews --all 默认是否进入“负评自动 + 正评半自动”的完整流程。
+    review_batch_all_with_positive_default: bool = Field(
+        default=True,
+        alias="REVIEW_BATCH_ALL_WITH_POSITIVE_DEFAULT",
+    )
+    # 正向人工接管前，自动滚到底部后预留给人工点击“下一页”的等待秒数。
+    review_positive_manual_prewait_seconds: float = Field(
+        default=10.0,
+        alias="REVIEW_POSITIVE_MANUAL_PREWAIT_SECONDS",
+    )
+    # 正向人工接管提示出现后，多久未输入就打印一次提醒。
+    review_positive_manual_reminder_seconds: float = Field(
+        default=90.0,
+        alias="REVIEW_POSITIVE_MANUAL_REMINDER_SECONDS",
+    )
     # 自动翻到下一页后的最小等待秒数，主要用于降低风控。
     review_positive_auto_page_delay_min_seconds: float = Field(
         default=30.0,

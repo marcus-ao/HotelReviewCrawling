@@ -76,7 +76,7 @@ def test_review_interruption_preserves_completed_pool_save():
     crawler.save_reviews = Mock(return_value=len(first_pool))
 
     with pytest.raises(CaptchaTimeoutException):
-        crawler.waterfall_crawl("10019773", max_reviews=10, save_to_db=True)
+        crawler.waterfall_crawl("10019773", max_reviews=30, save_to_db=True)
 
     crawler.save_reviews.assert_called_once_with(first_pool)
 
@@ -144,8 +144,10 @@ def test_waterfall_resume_negative_respects_total_review_cap():
     with patch("crawler.review_crawler.settings", fake_settings):
         reviews = crawler.waterfall_crawl("10019773", max_reviews=300, save_to_db=True)
 
-    assert len(reviews) == 100
-    assert crawler._crawl_pool.call_count == 0
+    assert len(reviews) == 280
+    assert crawler._crawl_pool.call_count == 1
+    assert crawler._crawl_pool.call_args.kwargs["source_pool"] == "negative"
+    assert crawler._crawl_pool.call_args.kwargs["max_count"] == 25
 
 
 def test_crawl_pool_stops_after_stagnant_pages():
@@ -190,6 +192,7 @@ def test_main_review_all_processes_multiple_batches_until_empty():
 
     fake_settings = SimpleNamespace(
         min_reviews_threshold=50,
+        review_batch_all_with_positive_default=True,
         review_positive_manual_default_enabled=True,
         log_path=Path("logs"),
     )
@@ -201,7 +204,7 @@ def test_main_review_all_processes_multiple_batches_until_empty():
         result = app_main.crawl_reviews(all_hotels=True)
 
     assert result == app_main.EXIT_SUCCESS
-    assert crawler_cls.call_args.kwargs["positive_manual"] is False
+    assert crawler_cls.call_args.kwargs["positive_manual"] is True
     assert crawler.crawl_hotel_reviews.call_count == 3
     crawler.crawl_hotel_reviews.assert_any_call("h1", save_to_db=True)
     crawler.crawl_hotel_reviews.assert_any_call("h2", save_to_db=True)
@@ -254,6 +257,7 @@ def test_main_review_all_forces_positive_manual_off():
 
     fake_settings = SimpleNamespace(
         min_reviews_threshold=50,
+        review_batch_all_with_positive_default=True,
         review_positive_manual_default_enabled=True,
         log_path=Path("logs"),
     )
@@ -266,6 +270,39 @@ def test_main_review_all_forces_positive_manual_off():
 
     assert result == app_main.EXIT_SUCCESS
     assert crawler_cls.call_args.kwargs["positive_manual"] is True
+
+
+def test_main_review_all_negative_only_forces_positive_manual_off():
+    anti = Mock()
+    anti.init_browser = Mock()
+    anti.close = Mock()
+
+    crawler = Mock()
+    crawler.crawl_hotel_reviews = Mock(return_value=[])
+
+    hotels = [SimpleNamespace(hotel_id="h1", review_count=500)]
+    session = Mock()
+    session.query.return_value.filter.return_value.order_by.return_value.all.return_value = hotels
+
+    @contextmanager
+    def fake_session_scope():
+        yield session
+
+    fake_settings = SimpleNamespace(
+        min_reviews_threshold=50,
+        review_batch_all_with_positive_default=True,
+        review_positive_manual_default_enabled=True,
+        log_path=Path("logs"),
+    )
+
+    with patch("main.AntiCrawler", return_value=anti), \
+         patch("main.ReviewCrawler", return_value=crawler) as crawler_cls, \
+         patch("main.session_scope", fake_session_scope), \
+         patch("main.settings", fake_settings):
+        result = app_main.crawl_reviews(all_hotels=True, positive_manual=False)
+
+    assert result == app_main.EXIT_SUCCESS
+    assert crawler_cls.call_args.kwargs["positive_manual"] is False
 
 
 def test_checkpoint_manager_roundtrip():
