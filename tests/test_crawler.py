@@ -505,6 +505,37 @@ class TestReviewCrawler:
         crawler._prepare_manual_positive_takeover.assert_called_once()
         crawler._input_with_timeout_reminder.assert_called_once()
 
+    def test_input_with_timeout_reminder_uses_threading_wrapper(self):
+        from crawler.review_crawler import ReviewCrawler
+
+        crawler = ReviewCrawler(anti_crawler=Mock(), positive_manual=True)
+
+        class DummyThread:
+            def __init__(self, target=None, daemon=None):
+                self._target = target
+                self._alive = True
+
+            def start(self):
+                if self._target:
+                    self._target()
+                self._alive = False
+
+            def join(self, timeout=None):
+                return None
+
+            def is_alive(self):
+                return self._alive
+
+        with patch("crawler.review_crawler.threading.Thread", DummyThread), \
+             patch("builtins.input", return_value="q"):
+            result = crawler._input_with_timeout_reminder(
+                prompt="test> ",
+                reminder_seconds=1.0,
+                reminder_message="reminder",
+            )
+
+        assert result == "q"
+
     def test_describe_manual_page_transition_contains_before_after(self):
         """人工翻页差异描述应包含前后摘要。"""
         from crawler.review_crawler import ReviewCrawler
