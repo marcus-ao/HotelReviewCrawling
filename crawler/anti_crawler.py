@@ -32,7 +32,9 @@ class AntiCrawler:
     def __init__(self):
         self.page: Optional[Any] = None
         self.is_connected = False
+        self.last_error: Optional[str] = None
         self._captcha_retry_count = 0
+        self._access_denied_retry_count = 0
         self._captcha_refresh_count = 0
         self._captcha_last_stage: Optional[str] = None
         self._captcha_slide_serial = 0
@@ -40,6 +42,10 @@ class AntiCrawler:
         self._captcha_click_slide_loop_count = 0
         self._captcha_error_code_streak = 0
         self._captcha_last_error_code: Optional[str] = None
+        self._session_warmed = False
+        self._last_session_warmup_at = 0.0
+        self._last_human_interaction_at = 0.0
+        self._blocked_url_patterns: list[str] = []
 
     def init_browser(self) -> Any:
         """初始化浏览器（接管已打开的Chrome）
@@ -56,6 +62,10 @@ class AntiCrawler:
             chromium_page_cls = getattr(drission_page, "ChromiumPage")
             self.page = chromium_page_cls(addr_or_opts=settings.chrome_address)
             self.is_connected = True
+            self.last_error = None
+            self._session_warmed = False
+            self._last_session_warmup_at = 0.0
+            self._last_human_interaction_at = 0.0
             logger.info(f"成功连接到Chrome浏览器: {settings.chrome_address}")
             return self.page
         except Exception as e:
@@ -84,6 +94,183 @@ class AntiCrawler:
         logger.debug(f"随机延迟 {delay:.2f} 秒")
         time.sleep(delay)
 
+    def ensure_page_foreground(self, reason: str = "interaction") -> None:
+        """尽力让页面处于前台并恢复焦点。"""
+        page = self.get_page()
+        try:
+            page.run_cdp("Page.bringToFront")
+        except Exception:
+            logger.debug("Page.bringToFront 调用失败，继续执行焦点恢复")
+
+        try:
+            state = page.run_js(
+                """
+                try {
+                    window.focus();
+                    if (document.body && typeof document.body.focus === 'function') {
+                        document.body.focus();
+                    }
+                } catch (e) {}
+                return {
+                    hasFocus: !!document.hasFocus(),
+                    visibility: document.visibilityState || 'unknown',
+                    readyState: document.readyState || 'unknown'
+                };
+                """
+            )
+            logger.debug(f"页面前台状态已尝试恢复: reason={reason}, state={state}")
+        except Exception as exc:
+            logger.debug(f"页面焦点恢复失败: reason={reason}, error={exc}")
+
+    def simulate_human_presence(self, reason: str = "interaction", *, include_scroll: bool = True) -> None:
+        """模拟轻量级人类操作：焦点、鼠标移动、微滚动、停顿。"""
+        if not settings.human_interaction_enabled:
+            return
+
+        page = self.get_page()
+        self.ensure_page_foreground(reason)
+
+        try:
+            page.run_js(
+                """
+                const width = Math.max(window.innerWidth || 1280, 400);
+                const height = Math.max(window.innerHeight || 800, 300);
+                const points = [
+                    [Math.floor(width * 0.22), Math.floor(height * 0.28)],
+                    [Math.floor(width * 0.37), Math.floor(height * 0.34)],
+                    [Math.floor(width * 0.52), Math.floor(height * 0.46)],
+                    [Math.floor(width * 0.66), Math.floor(height * 0.40)],
+                    [Math.floor(width * 0.58), Math.floor(height * 0.56)],
+                ];
+                for (const [x, y] of points) {
+                    document.dispatchEvent(new PointerEvent('pointermove', {
+                        bubbles: true,
+                        cancelable: true,
+                        pointerType: 'mouse',
+                        clientX: x,
+                        clientY: y,
+                    }));
+                    document.dispatchEvent(new MouseEvent('mousemove', {
+                        bubbles: true,
+                        cancelable: true,
+                        clientX: x,
+                        clientY: y,
+                    }));
+                }
+                return points.length;
+                """
+            )
+        except Exception as exc:
+            logger.debug(f"模拟鼠标移动失败: reason={reason}, error={exc}")
+
+        self.random_delay(0.12, 0.35)
+
+        if include_scroll:
+            try:
+                page.scroll.down(random.randint(80, 200))
+                self.random_delay(0.08, 0.22)
+                page.scroll.up(random.randint(30, 120))
+            except Exception as exc:
+                logger.debug(f"模拟微滚动失败: reason={reason}, error={exc}")
+
+        self._last_human_interaction_at = time.time()
+
+    def warm_session(self, reason: str = "warmup", *, force: bool = False) -> None:
+        """预热暖会话，降低冷启动时的风控概率。"""
+        if not settings.session_warmup_enabled:
+            return
+
+        now = time.time()
+        if (
+            self._session_warmed
+            and not force
+            and now - self._last_session_warmup_at < settings.session_idle_rewarm_seconds
+        ):
+            return
+
+        page = self.get_page()
+        current_url = str(getattr(page, "url", "") or "").lower()
+
+        if not current_url or "fliggy.com" not in current_url:
+            try:
+                page.get("https://www.fliggy.com/")
+                page.wait.load_start()
+            except Exception as exc:
+                logger.debug(f"会话预热首页访问失败: reason={reason}, error={exc}")
+
+        self.ensure_page_foreground(reason)
+        self.simulate_human_presence(reason=f"{reason}_presence", include_scroll=True)
+        self.random_delay(0.35, 0.9)
+        self._session_warmed = True
+        self._last_session_warmup_at = time.time()
+        logger.info(f"暖会话预热完成: reason={reason}")
+
+    def post_captcha_stabilize(self, reason: str = "captcha_recovered") -> None:
+        """验证码通过后的页面稳定化。"""
+        page = self.get_page()
+        self.ensure_page_foreground(reason)
+
+        try:
+            page.run_js(
+                """
+                try {
+                    window.focus();
+                    document.dispatchEvent(new Event('visibilitychange'));
+                    if (document.body && typeof document.body.focus === 'function') {
+                        document.body.focus();
+                    }
+                } catch (e) {}
+                return document.readyState || 'unknown';
+                """
+            )
+        except Exception as exc:
+            logger.debug(f"验证码恢复后页面稳定化脚本失败: reason={reason}, error={exc}")
+
+        self.simulate_human_presence(reason=f"{reason}_presence", include_scroll=False)
+        self.random_delay(0.45, 1.1)
+
+    @staticmethod
+    def _review_bootstrap_block_patterns() -> list[str]:
+        """评论模块自动初始化常用请求，先阻断避免进页即触发风控。"""
+        return [
+            "*://hotel.fliggy.com/ajax/getHotelRates.htm*",
+            "*://hotel.fliggy.com/ajax/getItemRates.htm*",
+            "*getHotelRates.htm*",
+            "*getItemRates.htm*",
+        ]
+
+    def set_blocked_urls(self, patterns: list[str], reason: str = "runtime") -> None:
+        """通过 CDP 设置临时 URL 阻断列表。"""
+        page = self.get_page()
+        normalized = [str(item).strip() for item in patterns if str(item).strip()]
+        try:
+            page.run_cdp("Network.enable")
+        except Exception:
+            logger.debug(f"设置URL阻断前启用Network域失败: reason={reason}")
+
+        try:
+            page.run_cdp("Network.setBlockedURLs", urls=normalized)
+            self._blocked_url_patterns = normalized
+            logger.info(
+                f"网络URL阻断已更新: reason={reason}, count={len(normalized)}, patterns={normalized or ['<empty>']}"
+            )
+        except TypeError:
+            try:
+                page.run_cdp("Network.setBlockedURLs", {"urls": normalized})
+                self._blocked_url_patterns = normalized
+                logger.info(
+                    f"网络URL阻断已更新: reason={reason}, count={len(normalized)}, patterns={normalized or ['<empty>']}"
+                )
+            except Exception as exc:
+                logger.warning(f"设置URL阻断失败: reason={reason}, error={exc}")
+        except Exception as exc:
+            logger.warning(f"设置URL阻断失败: reason={reason}, error={exc}")
+
+    def suppress_review_bootstrap_requests(self, enable: bool, reason: str = "review_navigation") -> None:
+        """控制评论模块自动初始化请求是否放行。"""
+        patterns = self._review_bootstrap_block_patterns() if enable else []
+        self.set_blocked_urls(patterns, reason=reason)
+
     def check_captcha(self, log_detected: bool = True) -> bool:
         """检查是否出现验证码
 
@@ -95,12 +282,23 @@ class AntiCrawler:
         """
         page = self.get_page()
 
+        if self.is_access_denied_blocked(log_detected=log_detected):
+            return True
+
         # 检查常见的滑块验证码元素
         captcha_selectors = [
             '#nc_1_n1z',           # 阿里滑块验证码
             '.nc-container',       # 滑块容器
             '.nc_wrapper',         # 滑块包装器
             '#baxia-dialog-content',  # 百度验证码
+            '#baxia-punish',
+            '.baxia-punish',
+            '.baxia-dialog',
+            '.baxia-dialog-content',
+            '#nocaptcha',
+            '.sm-pop-toplayer',
+            '.captcha-tips',
+            '#bx-feedback-btn',
             '.J_MIDDLEWARE_FRAME_WIDGET',  # 中间件验证
         ]
 
@@ -110,11 +308,26 @@ class AntiCrawler:
                     logger.warning(f"检测到验证码: {selector}")
                 return True
 
+        # 某些风控弹层节点是动态注入的，追加可见文本兜底。
+        visible_text = self._read_visible_text(page)
+        captcha_keywords = [
+            "请拖动下方滑块完成验证",
+            "通过验证以确保正常访问",
+            "验证失败，点击框体重试",
+            "点击框体重试",
+            "刷新后重试",
+        ]
+        if visible_text and any(keyword in visible_text for keyword in captcha_keywords):
+            if log_detected:
+                logger.warning("检测到验证码: visible_text_keyword")
+            return True
+
         return False
 
     def _reset_captcha_counters(self) -> None:
         """重置验证码重试计数器。"""
         self._captcha_retry_count = 0
+        self._access_denied_retry_count = 0
         self._captcha_refresh_count = 0
         self._captcha_last_stage = None
         self._captcha_slide_serial = 0
@@ -137,6 +350,217 @@ class AntiCrawler:
             "errorsp",
         ]
 
+    def _access_denied_keywords(self) -> list[str]:
+        return [
+            "亲，访问被拒绝",
+            "访问被拒绝",
+            "访问被拦截",
+            "访问受限",
+            "操作受限",
+            "请稍后再试",
+            "请点击反馈",
+        ]
+
+    def is_access_denied_blocked(self, log_detected: bool = True) -> bool:
+        page = self.get_page()
+        selectors = [
+            '#baxia-dialog-content',
+            '#baxia-punish',
+            '.baxia-punish',
+            '.baxia-dialog',
+            '.baxia-dialog-content',
+            '.sm-pop-toplayer',
+            '.captcha-tips',
+            '#bx-feedback-btn',
+            '.J_MIDDLEWARE_FRAME_WIDGET',
+            '.baxia-dialog-mask',
+        ]
+
+        context_chunks: list[str] = []
+        matched_selectors: list[str] = []
+        for selector in selectors:
+            try:
+                element = page.ele(selector, timeout=1)
+            except Exception:
+                element = None
+            if not element:
+                continue
+            matched_selectors.append(selector)
+            context_chunks.append(str(getattr(element, 'text', '') or ''))
+            context_chunks.append(str(getattr(element, 'html', '') or ''))
+
+        page_html = self._read_page_html(page)
+        page_url = str(getattr(page, 'url', '') or '')
+        context_text = "\n".join(item for item in context_chunks if item).lower()
+        visible_text = self._read_visible_text(page).lower()
+        keywords = [item.lower() for item in self._access_denied_keywords()]
+        html_lower = page_html.lower()
+
+        blocked = any(keyword in context_text for keyword in keywords)
+        blocked = blocked or any(keyword in visible_text for keyword in keywords)
+        blocked = blocked or ('punish' in page_url.lower() and bool(matched_selectors))
+        blocked = blocked or ('访问被拒绝' in page_html and bool(matched_selectors))
+        blocked = blocked or (
+            any(keyword in visible_text for keyword in keywords)
+            and any(marker in html_lower for marker in ('baxia', 'nocaptcha', 'bx-feedback-btn'))
+        )
+
+        if blocked and log_detected:
+            logger.warning(
+                f"检测到访问被拒绝风控: selectors={matched_selectors or ['unknown']}, url={page_url}"
+            )
+        return blocked
+
+    def _log_access_denied_context(self, reason: str) -> None:
+        page = self.get_page()
+        url = str(getattr(page, 'url', '') or '')
+        title = str(getattr(page, 'title', '') or '')
+        context = self._captcha_context_html(page) or self._read_page_html(page)
+        compact_context = re.sub(r'\s+', ' ', context).strip()[:300]
+        logger.warning(
+            f"访问拒绝记录: reason={reason}, url={url}, title={title}, "
+            f"signature={self._page_state_signature()}, access_retry={self._access_denied_retry_count}/"
+            f"{settings.access_denied_max_retries}, captcha_retry={self._captcha_retry_count}/"
+            f"{settings.captcha_max_retries}, context={compact_context or 'n/a'}"
+        )
+        self._save_captcha_debug_artifacts(f"access_denied_{reason}")
+
+    def _wait_access_denied_gone(self, rounds: int = 8) -> bool:
+        for _ in range(rounds):
+            self.random_delay(0.15, 0.35)
+            if not self.is_access_denied_blocked(log_detected=False):
+                return True
+        return False
+
+    def _dismiss_access_denied_modal(self) -> bool:
+        page = self.get_page()
+        close_selectors = [
+            '#baxia-dialog-content .close',
+            '#baxia-dialog-content .baxia-close',
+            '#baxia-dialog-content .next-dialog-close',
+            '#baxia-dialog-content [class*="close"]',
+            '#baxia-punish .close',
+            '.baxia-punish .close',
+            '.baxia-dialog .close',
+            '.baxia-dialog-content .close',
+            '.sm-pop-close',
+            '.J_MIDDLEWARE_FRAME_WIDGET [class*="close"]',
+        ]
+
+        for selector in close_selectors:
+            if self._click_selector_center(selector):
+                logger.info(f"已尝试关闭访问拒绝弹窗: selector={selector}")
+                if self._wait_access_denied_gone():
+                    return True
+
+        try:
+            clicked = page.run_js(
+                """
+                const roots = document.querySelectorAll(
+                  '#baxia-dialog-content, #baxia-punish, .baxia-punish, .baxia-dialog, .baxia-dialog-content, .sm-pop-toplayer, .sm-pop, .J_MIDDLEWARE_FRAME_WIDGET'
+                );
+                for (const root of roots) {
+                    const candidates = root.querySelectorAll('button, a, span, div, i');
+                    for (const el of candidates) {
+                        const text = (el.innerText || el.textContent || '').trim();
+                        const className = String(el.className || '');
+                        if (['×', '✕', '✖', 'x', 'X', '关闭', 'close'].includes(text) || /close/i.test(className)) {
+                            el.click();
+                            return 'keyword';
+                        }
+                    }
+                    const rect = root.getBoundingClientRect();
+                    if (rect.width > 20 && rect.height > 20) {
+                        const cx = rect.right - 24;
+                        const cy = rect.top + 24;
+                        const target = document.elementFromPoint(cx, cy) || root;
+                        for (const type of ['mouseover', 'mousedown', 'mouseup', 'click']) {
+                            target.dispatchEvent(new MouseEvent(type, {
+                                view: window,
+                                bubbles: true,
+                                cancelable: true,
+                                clientX: cx,
+                                clientY: cy,
+                                button: 0,
+                            }));
+                        }
+                        return 'hotspot';
+                    }
+                }
+                return '';
+                """
+            )
+            if clicked:
+                logger.info(f"已尝试关闭访问拒绝弹窗: mode={clicked}")
+                if self._wait_access_denied_gone():
+                    return True
+        except Exception as exc:
+            logger.debug(f"JS关闭访问拒绝弹窗失败: {exc}")
+
+        return False
+
+    def _recover_access_denied(self) -> bool:
+        page = self.get_page()
+        current_url = str(getattr(page, 'url', '') or '').strip()
+        self._access_denied_retry_count += 1
+        self._log_access_denied_context(f"retry_{self._access_denied_retry_count}")
+        context_html = (self._captcha_context_html(page) or self._read_page_html(page)).lower()
+
+        # 如果拒绝来源指向评论接口，优先阻断自动评论请求，避免关闭后立刻再次弹出。
+        if "gethotelrates" in context_html or "getitemrates" in context_html:
+            self.suppress_review_bootstrap_requests(True, reason="access_denied_review_bootstrap")
+
+        if self._dismiss_access_denied_modal() and not self.is_access_denied_blocked(log_detected=False):
+            logger.info("访问拒绝弹窗已关闭，继续当前页面")
+            self._access_denied_retry_count = 0
+            return True
+
+        if self._access_denied_retry_count > settings.access_denied_max_retries:
+            logger.warning("访问拒绝风控超过恢复上限，停止继续重试当前页面")
+            return False
+
+        try:
+            page.run_cdp("Page.stopLoading")
+        except Exception:
+            logger.debug("Page.stopLoading 失败，继续执行访问拒绝恢复")
+
+        backoff_min = max(0.5, settings.access_denied_backoff_min_seconds)
+        backoff_max = max(backoff_min, settings.access_denied_backoff_max_seconds)
+
+        try:
+            page.get("https://www.fliggy.com/")
+            page.wait.load_start()
+            self.random_delay(backoff_min, backoff_max)
+        except Exception as exc:
+            logger.warning(f"访问拒绝恢复阶段跳转首页失败: {exc}")
+
+        try:
+            page.scroll.down(random.randint(250, 700))
+        except Exception:
+            logger.debug("访问拒绝恢复阶段首页滚动失败，继续")
+
+        self.random_delay(1.0, 2.0)
+
+        if not current_url:
+            return not self.is_access_denied_blocked(log_detected=False)
+
+        retry_url = self._append_cache_buster(current_url)
+        logger.info(f"访问拒绝恢复：重新打开页面 {retry_url}")
+        try:
+            page.get(retry_url)
+            page.wait.load_start()
+            self.random_delay(1.2, 2.8)
+        except Exception as exc:
+            logger.warning(f"访问拒绝恢复阶段重开页面失败: {exc}")
+            return False
+
+        recovered = not self.is_access_denied_blocked(log_detected=False)
+        if recovered:
+            logger.info("访问拒绝恢复成功，页面已解除拦截")
+            self.post_captcha_stabilize("access_denied_recovered")
+            self._access_denied_retry_count = 0
+        return recovered
+
     @staticmethod
     def _read_page_html(page: Any) -> str:
         """读取页面 HTML，失败时返回空字符串。"""
@@ -146,14 +570,34 @@ class AntiCrawler:
             return ""
         return raw_html if isinstance(raw_html, str) else str(raw_html or "")
 
+    @staticmethod
+    def _read_visible_text(page: Any) -> str:
+        """读取页面可见文本，避免脚本模板关键字引入误判。"""
+        try:
+            text = page.run_js(
+                """
+                const body = document && document.body;
+                if (!body) return '';
+                return (body.innerText || '').trim();
+                """
+            )
+        except Exception:
+            return ""
+        return text if isinstance(text, str) else str(text or "")
+
     def _captcha_context_html(self, page: Any) -> str:
         """读取验证码容器上下文 HTML，避免全页关键字误判。"""
         container_selectors = [
             "#baxia-punish",
+            ".baxia-punish",
+            ".baxia-dialog",
+            ".baxia-dialog-content",
             "#nocaptcha",
             ".nc-container",
             ".nc_wrapper",
             "#baxia-dialog-content",
+            ".sm-pop-toplayer",
+            ".captcha-tips",
             ".J_MIDDLEWARE_FRAME_WIDGET",
         ]
 
@@ -201,6 +645,9 @@ class AntiCrawler:
     def _detect_captcha_stage(self) -> str:
         """Detect current captcha stage: refresh_click / slider / captcha_generic / none."""
         page = self.get_page()
+
+        if self.is_access_denied_blocked(log_detected=False):
+            return "access_denied"
 
         context_html = self._captcha_context_html(page)
         refresh_keywords = [item.lower() for item in self._refresh_prompt_keywords()]
@@ -531,6 +978,10 @@ class AntiCrawler:
     def _click_selector_center(self, selector: str) -> bool:
         """Best-effort click selector center, prefer native click first."""
         page = self.get_page()
+        self.ensure_page_foreground(f"click:{selector}")
+        if settings.human_interaction_enabled:
+            self.simulate_human_presence(reason=f"click:{selector}", include_scroll=False)
+            self.random_delay(0.08, 0.22)
         try:
             target = page.ele(selector, timeout=1)
             if target:
@@ -806,6 +1257,28 @@ class AntiCrawler:
 
             stage = self._detect_captcha_stage()
 
+            if stage == "access_denied":
+                total_actions += 1
+                if self._recover_access_denied():
+                    attempts_since_refresh = 0
+                    self._captcha_retry_count = 0
+                    self._captcha_refresh_count = 0
+                    self._captcha_last_stage = None
+                    no_progress_start_time = time.time()
+                    self._captcha_attempt_interval_delay("after_refresh")
+                    continue
+
+                next_retry_count = max(1, self._access_denied_retry_count)
+                self._raise_captcha_failure(
+                    CaptchaTimeoutException(
+                        timeout_seconds=settings.captcha_solve_timeout_seconds,
+                        elapsed_seconds=session_elapsed_seconds,
+                        retry_count=next_retry_count,
+                        max_retries=settings.access_denied_max_retries,
+                    ),
+                    reason="访问被拒绝风控持续触发，进入冷却",
+                )
+
             if stage == "refresh_click":
                 error_code = self._extract_captcha_error_code()
                 if error_code:
@@ -912,6 +1385,8 @@ class AntiCrawler:
                     reason="点击重试阶段持续失败，超过刷新上限后进入冷却",
                 )
 
+            success = False
+            captcha_still_present = True
             success = self._auto_slide_captcha()
             total_actions += 1
             self._captcha_attempt_interval_delay("slide_followup")
@@ -959,6 +1434,7 @@ class AntiCrawler:
                     logger.info("自动滑块验证成功")
                 else:
                     logger.info("验证码元素已消失，判定验证通过")
+                self.post_captcha_stabilize("captcha_cleared")
                 self._reset_captcha_counters()
                 return
 
@@ -1191,6 +1667,8 @@ class AntiCrawler:
         page = self.get_page()
 
         try:
+            self.last_error = None
+            self.warm_session(reason="pre_navigation")
             logger.info(f"导航到: {url}")
             page.get(url)
 
@@ -1202,6 +1680,9 @@ class AntiCrawler:
             if self.check_captcha():
                 self.handle_captcha()
 
+            self.ensure_page_foreground("post_navigation")
+            self.simulate_human_presence(reason="post_navigation", include_scroll=False)
+
             return True
 
         except (CaptchaException, CaptchaCooldownException):
@@ -1209,6 +1690,7 @@ class AntiCrawler:
             raise
 
         except Exception as e:
+            self.last_error = str(e)
             logger.error(f"导航失败: {e}")
             return False
 

@@ -5,6 +5,9 @@
 """
 
 # 价格档次配置（适用于所有功能区）
+# level: 展示用价格档位名称
+# min/max: 该档位在飞猪列表页中的价格区间，max=99999 表示上不封顶
+# top_n: 默认每个商圈在该档位需要保留的酒店数量
 PRICE_RANGES = [
     {"level": "经济型", "min": 0, "max": 300, "top_n": 4},
     {"level": "舒适型", "min": 300, "max": 600, "top_n": 6},
@@ -13,6 +16,11 @@ PRICE_RANGES = [
 ]
 
 # 广州6大功能区配置
+# description: 功能区的典型客群和场景描述
+# typical_price_range: 该功能区常见价格带，主要用于人工理解与文档展示
+# business_zones: 核心商圈；code 来自飞猪 URL 参数 businessAreaId
+# price_ranges: 该功能区复用的价格档配置
+# keywords/aspect_focus: 后续做评论知识库、检索或方面分析时可参考的主题词
 GUANGZHOU_REGIONS = {
     "CBD商务区": {
         "description": "商务精英/购物达人，诉求：效率、排面、景观、便利",

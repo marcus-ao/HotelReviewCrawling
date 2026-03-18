@@ -251,3 +251,21 @@ class BrowserConnectionException(CrawlerException):
         self.reason = reason
         message = f"浏览器连接失败: {reason}"
         super().__init__(message)
+
+
+
+class RecoverableInterruption(CrawlerException):
+    """????????"""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        action: str,
+        checkpoint_path: str = "",
+        context: dict | None = None,
+    ):
+        self.action = action
+        self.checkpoint_path = checkpoint_path
+        self.context = context or {}
+        super().__init__(message)

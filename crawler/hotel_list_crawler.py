@@ -11,10 +11,11 @@ from config.settings import settings
 from config.regions import GUANGZHOU_REGIONS, PRICE_RANGES
 from utils.logger import get_logger
 from utils.cleaner import clean_text, normalize_hotel_name
+from utils.checkpoint_manager import CheckpointManager, looks_like_recoverable_error
 from database.connection import session_scope
-from database.models import Hotel, CrawlTask
+from database.models import Hotel
 from .anti_crawler import AntiCrawler
-from .exceptions import CaptchaCooldownException, CaptchaException
+from .exceptions import CaptchaCooldownException, CaptchaException, RecoverableInterruption
 
 logger = get_logger("hotel_list_crawler")
 
@@ -40,6 +41,12 @@ class HotelListCrawler:
 
     # 飞猪酒店列表URL模板
     BASE_URL = "https://hotel.fliggy.com/hotel_list3.htm"
+    TIER_COMPENSATION_PRIORITY = {
+        "高档型": ("奢华型", "舒适型", "经济型"),
+        "奢华型": ("高档型", "舒适型", "经济型"),
+        "舒适型": ("经济型", "高档型", "奢华型"),
+        "经济型": ("舒适型", "高档型", "奢华型"),
+    }
 
     def __init__(self, anti_crawler: Optional[AntiCrawler] = None):
         """初始化爬虫
@@ -50,6 +57,7 @@ class HotelListCrawler:
         self.anti_crawler = anti_crawler or AntiCrawler()
         self.page = None
         self._position_context: dict[str, object] = {}
+        self.checkpoints = CheckpointManager()
 
     def build_search_url(
         self,
@@ -112,6 +120,71 @@ class HotelListCrawler:
     def _log_captcha_failure(self, action: str, exc: Exception) -> None:
         """Log captcha failure with current crawl context."""
         _context_helpers().log_captcha_failure(logger, self._position_context, action, exc)
+
+    @staticmethod
+    def _hotel_list_checkpoint_key(region_type: str, business_zone_code: str, price_level: str) -> str:
+        return f"{region_type}_{business_zone_code}_{price_level}"
+
+    def _load_hotel_list_checkpoint(
+        self,
+        region_type: str,
+        business_zone_code: str,
+        price_level: str,
+    ) -> Optional[dict[str, object]]:
+        return self.checkpoints.load(
+            "hotel_list",
+            self._hotel_list_checkpoint_key(region_type, business_zone_code, price_level),
+        )
+
+    def _save_hotel_list_checkpoint(
+        self,
+        region_type: str,
+        business_zone_code: str,
+        price_level: str,
+        payload: dict[str, object],
+    ) -> str:
+        return self.checkpoints.save(
+            "hotel_list",
+            self._hotel_list_checkpoint_key(region_type, business_zone_code, price_level),
+            payload,
+        )
+
+    def _clear_hotel_list_checkpoint(
+        self,
+        region_type: str,
+        business_zone_code: str,
+        price_level: str,
+    ) -> None:
+        self.checkpoints.clear(
+            "hotel_list",
+            self._hotel_list_checkpoint_key(region_type, business_zone_code, price_level),
+        )
+
+    def _raise_recoverable_hotel_list_interruption(
+        self,
+        *,
+        region_type: str,
+        business_zone_code: str,
+        price_level: str,
+        action: str,
+        message: str,
+    ) -> None:
+        payload = {
+            "region_type": region_type,
+            "business_zone_code": business_zone_code,
+            "price_level": price_level,
+            "current_page": self._position_context.get("current_page"),
+            "current_url": self._position_context.get("current_url"),
+            "saved_count": self._position_context.get("saved_count"),
+            "target_count": self._position_context.get("target_count"),
+        }
+        checkpoint_path = self._save_hotel_list_checkpoint(region_type, business_zone_code, price_level, payload)
+        raise RecoverableInterruption(
+            message,
+            action=action,
+            checkpoint_path=checkpoint_path,
+            context=payload,
+        )
 
     def _get_saved_hotel_ids(
         self,
@@ -208,23 +281,6 @@ class HotelListCrawler:
         ratio = self._get_tier_floor_ratio(price_level)
         floor_count = int(math.ceil(target * ratio))
         return max(0, min(floor_count, target))
-
-    def _record_sampling_audit(
-        self,
-        session,
-        hotel_data: dict,
-        sample_source: str,
-        min_review_count: int,
-        borrow_for_region: Optional[str] = None,
-    ) -> None:
-        """Persist per-hotel sampling source for auditability."""
-        _persistence_helpers().record_sampling_audit(
-            session=session,
-            hotel_data=hotel_data,
-            sample_source=sample_source,
-            min_review_count=min_review_count,
-            borrow_for_region=borrow_for_region,
-        )
 
     def _crawl_region_tier_incremental(
         self,
@@ -1102,6 +1158,13 @@ class HotelListCrawler:
 
         mode_label = "增采" if incremental_target else "爬取"
         logger.info(f"开始{mode_label}: {region_type} - {zone_name} - {price_level} (目标: {top_n}家)")
+        checkpoint = self._load_hotel_list_checkpoint(region_type, zone_code, price_level)
+        if checkpoint:
+            logger.info(
+                f"检测到酒店列表断点，准备恢复: region={region_type}, zone={zone_code}, "
+                f"price_level={price_level}, page={checkpoint.get('current_page')}, "
+                f"saved={checkpoint.get('saved_count')}"
+            )
 
         saved_hotel_ids = self._get_saved_hotel_ids(region_type, zone_code, price_level) if save_to_db else set()
         if incremental_target:
@@ -1129,6 +1192,8 @@ class HotelListCrawler:
             price_min=price_range['min'],
             price_max=price_range['max'],
         )
+        if checkpoint and checkpoint.get("current_url"):
+            url = str(checkpoint.get("current_url"))
 
         self._update_position_context(
             region_type=region_type,
@@ -1144,6 +1209,15 @@ class HotelListCrawler:
         # 导航到页面
         try:
             if not self.anti_crawler.navigate_to(url):
+                last_error = self.anti_crawler.last_error or "navigate_to returned False"
+                if looks_like_recoverable_error(last_error):
+                    self._raise_recoverable_hotel_list_interruption(
+                        region_type=region_type,
+                        business_zone_code=zone_code,
+                        price_level=price_level,
+                        action="hotel_list_navigation",
+                        message=f"酒店列表导航可恢复中断: {last_error}",
+                    )
                 logger.error(f"导航失败: {url}")
                 self._clear_position_context()
                 return []
@@ -1181,14 +1255,41 @@ class HotelListCrawler:
             )
             hotels.extend(prepared_hotels)
             self._update_position_context(saved_count=len(saved_hotel_ids) + len(hotels), current_page=page_no)
+            self._save_hotel_list_checkpoint(
+                region_type,
+                zone_code,
+                price_level,
+                {
+                    "region_type": region_type,
+                    "business_zone_code": zone_code,
+                    "price_level": price_level,
+                    "current_page": page_no,
+                    "current_url": self._position_context.get("current_url"),
+                    "saved_count": len(saved_hotel_ids) + len(hotels),
+                    "target_count": remaining_target,
+                },
+            )
 
-        raw_hotels = self.extract_hotels_from_page(
-            max_hotels=remaining_target,
-            exclude_ids=effective_exclude_ids,
-            min_review_count=effective_min_review_count,
-            price_range=price_range,
-            page_callback=persist_page_hotels if save_to_db else None,
-        )
+        try:
+            raw_hotels = self.extract_hotels_from_page(
+                max_hotels=remaining_target,
+                exclude_ids=effective_exclude_ids,
+                min_review_count=effective_min_review_count,
+                price_range=price_range,
+                page_callback=persist_page_hotels if save_to_db else None,
+            )
+        except RecoverableInterruption:
+            raise
+        except Exception as exc:
+            if looks_like_recoverable_error(exc):
+                self._raise_recoverable_hotel_list_interruption(
+                    region_type=region_type,
+                    business_zone_code=zone_code,
+                    price_level=price_level,
+                    action="hotel_list_extract",
+                    message=f"酒店列表提取可恢复中断: {exc}",
+                )
+            raise
 
         if not save_to_db:
             hotels = self._prepare_hotels_for_price_range(
@@ -1207,6 +1308,7 @@ class HotelListCrawler:
         else:
             actual_total = len(saved_hotel_ids) + len(hotels)
             logger.info(f"爬取完成: {actual_total}/{top_n} 家酒店 (新增{len(hotels)}家)")
+        self._clear_hotel_list_checkpoint(region_type, zone_code, price_level)
         self._clear_position_context()
         return hotels
 
@@ -1265,167 +1367,210 @@ class HotelListCrawler:
         exclude_ids: Optional[set[str]] = None,
         save_to_db: bool = True,
     ) -> list[dict]:
-        """对单个商圈执行“弹性补位”爬取，保证尽量达到目标数量。"""
+        """对单个商圈执行“两阶段补位”爬取，避免价格档来回回摆。"""
         zone_name = business_zone['name']
         zone_code = business_zone['code']
         zone_target_total = sum(pr['top_n'] for pr in price_ranges)
 
-        logger.info(f"开始弹性补位: {region_type} - {zone_name} (目标: {zone_target_total}家)")
+        logger.info(f"开始两阶段补位采集: {region_type} - {zone_name} (目标: {zone_target_total}家)")
 
         zone_hotels: list[dict] = []
         zone_seen_ids: set[str] = set(exclude_ids) if exclude_ids else set()
-        remaining = zone_target_total
-        carry_over = 0
         exhausted_price_levels: set[str] = set()
+        borrowed_from_tier: dict[str, int] = defaultdict(int)
+        tier_stats: dict[str, dict] = {}
 
-        # 正向遍历价格档次，将缺口顺延到相邻更高价位
-        for price_range in price_ranges:
-            if remaining <= 0:
-                break
+        def _count_saved(level: str) -> int:
+            if not save_to_db:
+                return 0
+            return len(self._get_saved_hotel_ids(region_type, zone_code, level))
 
-            base_target = price_range['top_n']
-            target = base_target + carry_over
-            if target > remaining:
-                target = remaining
+        def _tier_borrow_limit(level: str, target: int) -> int:
+            guard_count = max(1, int(math.ceil(target * settings.sampling_donor_guard_ratio)))
+            return max(target - guard_count, 0)
+
+        def _origin_borrow_cap(target: int) -> int:
             if target <= 0:
-                carry_over = 0
-                continue
+                return 0
+            return max(1, int(math.ceil(target * settings.sampling_borrow_cap_ratio)))
+
+        def _crawl_tier_once(
+            *,
+            price_range: dict,
+            target_count: int,
+            mode_label: str,
+            origin_tier: Optional[str] = None,
+            candidate_tier: Optional[str] = None,
+        ) -> tuple[list[dict], int, int]:
+            level = price_range['level']
+            existing_before_count = _count_saved(level)
+            if save_to_db and existing_before_count:
+                zone_seen_ids.update(self._get_saved_hotel_ids(region_type, zone_code, level))
 
             logger.info(
-                f"弹性目标: {zone_name} - {price_range['level']} "
-                f"(基础{base_target} + 追加{carry_over} = {target})"
+                f"{mode_label}: {zone_name} - target={origin_tier or level}, candidate={candidate_tier or level}, "
+                f"level={level}, request={target_count}"
             )
-
-            existing_before_ids: set[str] = set()
-            if save_to_db:
-                existing_before_ids = self._get_saved_hotel_ids(region_type, zone_code, price_range['level'])
-                if existing_before_ids:
-                    zone_seen_ids.update(existing_before_ids)
-            existing_before_count = len(existing_before_ids)
 
             hotels = self.crawl_by_zone_and_price(
                 region_type=region_type,
                 business_zone=business_zone,
                 price_range=price_range,
-                target_count=target,
+                target_count=target_count,
                 exclude_ids=zone_seen_ids,
                 save_to_db=save_to_db,
             )
 
-            # 更新商圈内已采集的酒店集合
-            for h in hotels:
-                if h.get('hotel_id'):
-                    zone_seen_ids.add(h['hotel_id'])
-
+            for hotel in hotels:
+                hotel_id = hotel.get('hotel_id')
+                if hotel_id:
+                    zone_seen_ids.add(hotel_id)
             zone_hotels.extend(hotels)
 
             if save_to_db:
-                existing_after_count = len(self._get_saved_hotel_ids(region_type, zone_code, price_range['level']))
+                existing_after_count = _count_saved(level)
                 actual = existing_after_count
                 new_added = max(existing_after_count - existing_before_count, 0)
             else:
                 actual = len(hotels)
                 new_added = len(hotels)
 
-            achieved_for_target = min(target, actual)
-            remaining = max(remaining - achieved_for_target, 0)
-            carry_over = max(target - achieved_for_target, 0)
+            if target_count > 0 and new_added == 0 and actual < target_count:
+                exhausted_price_levels.add(level)
+                logger.info(f"档位耗尽: {zone_name} - {level}, mode={mode_label}, request={target_count}")
+            elif new_added > 0:
+                exhausted_price_levels.discard(level)
+
+            self.anti_crawler.random_delay(3, 6)
+            return hotels, actual, new_added
+
+        # 阶段A：各档独立主采，不再顺延缺口。
+        for price_range in price_ranges:
+            level = price_range['level']
+            target = int(price_range['top_n'])
+            logger.info(f"主采开始: {zone_name} - {level}, target={target}")
+            _, actual, new_added = _crawl_tier_once(
+                price_range=price_range,
+                target_count=target,
+                mode_label="主采",
+            )
+
+            deficit = max(target - actual, 0)
+            tier_stats[level] = {
+                "price_range": price_range,
+                "target": target,
+                "actual": actual,
+                "new_added": new_added,
+                "deficit": deficit,
+                "borrowed_in": 0,
+                "borrow_cap": _origin_borrow_cap(target),
+            }
 
             logger.info(
-                f"{zone_name} - {price_range['level']} 完成统计: "
-                f"已完成 {actual}/{target} 家, 本轮新增 {new_added} 家"
+                f"主采完成: {zone_name} - {level}, target={target}, actual={actual}, "
+                f"new_added={new_added}, deficit={deficit}, exhausted={level in exhausted_price_levels}"
             )
-
-            if save_to_db and target > 0 and new_added == 0:
-                exhausted_price_levels.add(price_range['level'])
-                logger.info(
-                    f"{zone_name} - {price_range['level']} 本轮无增量，标记为耗尽档位"
-                )
-            elif save_to_db and new_added > 0:
-                exhausted_price_levels.discard(price_range['level'])
-
-            if carry_over > 0:
+            if deficit > 0:
                 logger.warning(
-                    f"{zone_name} - {price_range['level']} 数量不足，"
-                    f"缺口 {carry_over} 家将转移到相邻价位"
+                    f"主采不足: {zone_name} - {level}, deficit={deficit}, "
+                    f"borrow_cap={tier_stats[level]['borrow_cap']}"
                 )
 
-            # 每次爬取后随机延迟
-            self.anti_crawler.random_delay(3, 6)
+        # 阶段B：统一补偿，不允许回摆。
+        for price_range in price_ranges:
+            origin_tier = price_range['level']
+            stat = tier_stats.get(origin_tier)
+            if not stat:
+                continue
 
-        # 如果最后仍有缺口，反向回补到相邻更低价位
-        if remaining > 0:
-            logger.warning(
-                f"{zone_name} 仍缺少 {remaining} 家酒店，开始反向补位"
+            remaining_deficit = int(stat["deficit"])
+            borrow_cap = int(stat["borrow_cap"])
+            if remaining_deficit <= 0:
+                continue
+
+            allowed_compensation = max(borrow_cap - int(stat["borrowed_in"]), 0)
+            if allowed_compensation <= 0:
+                logger.warning(
+                    f"最终不足: {zone_name} - {origin_tier}, deficit={remaining_deficit}, "
+                    f"reason=borrow_cap_reached"
+                )
+                continue
+
+            remaining_deficit = min(remaining_deficit, allowed_compensation)
+            attempted_tiers: set[str] = set()
+            logger.info(
+                f"补偿开始: {zone_name} - origin_tier={origin_tier}, deficit={remaining_deficit}, "
+                f"candidates={list(self.TIER_COMPENSATION_PRIORITY.get(origin_tier, ())) or ['<none>']}"
             )
-            for idx, price_range in enumerate(reversed(price_ranges)):
-                if remaining <= 0:
+
+            for candidate_tier in self.TIER_COMPENSATION_PRIORITY.get(origin_tier, ()):
+                if remaining_deficit <= 0:
                     break
-                # Skip highest tier in reverse fill (already attempted)
-                if idx == 0:
+                if candidate_tier == origin_tier or candidate_tier in attempted_tiers:
                     continue
+                attempted_tiers.add(candidate_tier)
 
-                target = remaining
-                logger.info(
-                    f"反向补位: {zone_name} - {price_range['level']} (目标: {target})"
-                )
-
-                if save_to_db and price_range['level'] in exhausted_price_levels:
+                candidate_stat = tier_stats.get(candidate_tier)
+                candidate_price_range = next((pr for pr in price_ranges if pr['level'] == candidate_tier), None)
+                if not candidate_stat or not candidate_price_range:
                     logger.info(
-                        f"反向补位跳过: {zone_name} - {price_range['level']} "
-                        f"(本轮已验证无增量，避免重复空转)"
+                        f"补偿跳过: {zone_name} - origin_tier={origin_tier}, candidate_tier={candidate_tier}, "
+                        "reason=missing_candidate"
                     )
                     continue
 
-                existing_before_ids: set[str] = set()
-                if save_to_db:
-                    existing_before_ids = self._get_saved_hotel_ids(region_type, zone_code, price_range['level'])
-                    if existing_before_ids:
-                        zone_seen_ids.update(existing_before_ids)
-                existing_before_count = len(existing_before_ids)
+                if candidate_tier in exhausted_price_levels:
+                    logger.info(
+                        f"补偿跳过: {zone_name} - origin_tier={origin_tier}, candidate_tier={candidate_tier}, "
+                        "reason=candidate_exhausted"
+                    )
+                    continue
 
-                hotels = self.crawl_by_zone_and_price(
-                    region_type=region_type,
-                    business_zone=business_zone,
-                    price_range=price_range,
-                    target_count=target,
-                    exclude_ids=zone_seen_ids,
-                    save_to_db=save_to_db,
+                candidate_limit = _tier_borrow_limit(candidate_tier, int(candidate_stat["target"]))
+                candidate_remaining = max(candidate_limit - borrowed_from_tier[candidate_tier], 0)
+                if candidate_remaining <= 0:
+                    logger.info(
+                        f"补偿跳过: {zone_name} - origin_tier={origin_tier}, candidate_tier={candidate_tier}, "
+                        "reason=donor_guard_reached"
+                    )
+                    continue
+
+                request = min(remaining_deficit, candidate_remaining)
+                logger.info(
+                    f"补偿候选: {zone_name} - origin_tier={origin_tier}, candidate_tier={candidate_tier}, "
+                    f"request={request}, remaining_deficit={remaining_deficit}"
                 )
 
-                for h in hotels:
-                    if h.get('hotel_id'):
-                        zone_seen_ids.add(h['hotel_id'])
+                _, candidate_actual, new_added = _crawl_tier_once(
+                    price_range=candidate_price_range,
+                    target_count=request,
+                    mode_label="补偿",
+                    origin_tier=origin_tier,
+                    candidate_tier=candidate_tier,
+                )
 
-                zone_hotels.extend(hotels)
-
-                if save_to_db:
-                    existing_after_count = len(self._get_saved_hotel_ids(region_type, zone_code, price_range['level']))
-                    actual = existing_after_count
-                    new_added = max(existing_after_count - existing_before_count, 0)
-                else:
-                    actual = len(hotels)
-                    new_added = len(hotels)
-
-                # 反向补位是“补缺口”动作，remaining 仅按本轮新增贡献递减。
-                achieved_for_target = min(target, new_added)
-                remaining = max(remaining - achieved_for_target, 0)
+                borrowed_from_tier[candidate_tier] += new_added
+                stat["borrowed_in"] += new_added
+                remaining_deficit = max(remaining_deficit - new_added, 0)
 
                 logger.info(
-                    f"反向补位统计: {zone_name} - {price_range['level']} "
-                    f"已完成 {actual}/{target} 家, 本轮新增 {new_added} 家"
+                    f"补偿完成: {zone_name} - origin_tier={origin_tier}, candidate_tier={candidate_tier}, "
+                    f"candidate_actual={candidate_actual}, added={new_added}, remaining_deficit={remaining_deficit}"
                 )
 
-                if save_to_db and target > 0 and new_added == 0:
-                    exhausted_price_levels.add(price_range['level'])
+                if new_added == 0:
+                    logger.warning(
+                        f"补偿失败: {zone_name} - origin_tier={origin_tier}, candidate_tier={candidate_tier}, "
+                        "reason=no_increment"
+                    )
+                if remaining_deficit <= 0:
+                    break
 
-                # 每次爬取后随机延迟
-                self.anti_crawler.random_delay(3, 6)
-
-            if remaining > 0:
+            stat["deficit"] = remaining_deficit
+            if remaining_deficit > 0:
                 logger.warning(
-                    f"{zone_name} 最终仍缺少 {remaining} 家，"
-                    f"可能需要调整筛选或增加页数"
+                    f"最终不足: {zone_name} - origin_tier={origin_tier}, remaining_deficit={remaining_deficit}, "
+                    f"attempted={sorted(attempted_tiers) or ['<none>']}"
                 )
 
         if save_to_db:
@@ -1438,7 +1583,7 @@ class HotelListCrawler:
         else:
             achieved_total = len(zone_hotels)
         logger.info(
-            f"商圈 {zone_name} 弹性补位完成，实际 {achieved_total}/{zone_target_total} 家"
+            f"商圈 {zone_name} 两阶段补位完成，实际 {achieved_total}/{zone_target_total} 家"
         )
         return zone_hotels
 

@@ -38,7 +38,6 @@ def setup_logger() -> None:
         level="DEBUG",
         rotation="00:00",
         retention="30 days",
-        compression="zip",
         encoding="utf-8",
     )
 
@@ -49,14 +48,13 @@ def setup_logger() -> None:
         level="ERROR",
         rotation="00:00",
         retention="60 days",
-        compression="zip",
         encoding="utf-8",
     )
 
     logger.info("日志系统初始化完成")
 
 
-def get_logger(name: str = None):
+def get_logger(name: str = ""):
     """获取日志记录器
 
     Args:

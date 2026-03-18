@@ -8,7 +8,7 @@
 crawler/
 ├── anti_crawler.py        # 320行 — 浏览器接管/自动化验证码/导航/滚动
 ├── hotel_list_crawler.py    # 1304行 — 酒店列表爬取 (最大文件, 建议拆分)
-└── review_crawler.py        # 645行 — 评论瀑布流采集
+└── review_crawler.py        # 评论双池采集：negative自动 / positive人工辅助
 ```
 
 ## ARCHITECTURE
@@ -31,10 +31,9 @@ main.py
   │     └─→ fetch_hotel_details() × N酒店      ← 正则提取详情页字段
   │
   └─→ ReviewCrawler.crawl_hotel_reviews()      # 阶段二: 评论采集
-        └─→ waterfall_crawl()          ← 瀑布流入口
-              ├─→ _crawl_pool("negative", [BAD,MEDIUM], max=100)
-              ├─→ _crawl_pool("evidence", [ALL], images=True, max=150)
-            └─→ _crawl_pool("latest",   [ALL], max=剩余)
+        └─→ waterfall_crawl()          ← 双池入口
+              ├─→ _crawl_pool("negative", [BAD], max=100)
+              └─→ _crawl_positive_pool_manual(...)
                ├─→ filter_reviews()              ← 点击筛选tab
         ├─→ extract_reviews_from_page()    ← DOM解析评论
                     │     └─→ _parse_review_element()  ← 单条评论提取
@@ -117,14 +116,13 @@ main.py
 - 新酒店 → `HotelModel` 校验后 `session.add`
 - 二次评论数过滤: `review_count <= min_reviews_threshold` 再次跳过
 
-## review_crawler.py — 评论瀑布流采集
+## review_crawler.py — 评论双池采集
 
-### 瀑布流三池
+### 双池策略
 
-`waterfall_crawl` (line 434): 硬编码配额
-- negative池: `filter_types=[FILTER_BAD(3), FILTER_MEDIUM(2)]`, max=100
-- evidence池: `filter_types=[FILTER_ALL(0)]`, `with_images=True`, max=150
-- latest池: `filter_types=[FILTER_ALL(0)]`, max=剩余(最多50)
+`waterfall_crawl`
+- negative池: `filter_types=[FILTER_BAD(2)]`, 在线分页主采
+- positive池: `_crawl_positive_pool_manual()`, 人工翻页 + HTML提取
 
 ### 评论筛选
 
@@ -168,7 +166,7 @@ main.py
 ## KNOWN BUGS & RISKS
 
 1. **hotel_list_crawler.py:225** — HTML回退分支 `hotel_data` 变量泄漏: `_price_in_range(hotel_data.get('base_price'), price_range)` 中的 `hotel_data` 是上一次循环的值，应为当前 `hotel_id` 对应的数据
-2. **瀑布流池配额硬编码** — negative=100, evidence=150 写死在方法体内，应提取到settings
+2. **正向池依赖人工翻页** — CLI/终端提示与页面变化校验是核心流程，修改时需优先保持幂等和去重安全
 3. **CSS选择器脆弱** — 飞猪改版会导致 `.tb-r-comment`, `.tb-r-cnt`, `.starscore` 等批量失效
 4. **hotel_list_crawler.py 过大** — 1304行单文件，建议拆分: 提取逻辑/翻页逻辑/入库逻辑/弹性补位
 
@@ -213,7 +211,7 @@ main.py
 | 修改翻页逻辑 | `_go_to_next_page` | 588 |
 | 修改弹性补位算法 | `_crawl_business_zone_elastic` | 966 |
 | 修改评论CSS选择器 | `_parse_review_element` | 273 |
-| 修改瀑布流配额 | `waterfall_crawl` | 434 |
+| 修改负向池配额 | `waterfall_crawl` | 见双池入口 |
 | 修改验证码选择器 | `check_captcha` | 67 |
 | 修改滑块模拟行为 | `_auto_slide_captcha` | 129 |
 | 修改排序策略 | `_sort_key` in `extract_hotels_from_page` | 150 |

@@ -44,12 +44,12 @@ HotelReviewCrawing/
 │   ├── __init__.py             # 模块初始化，导出三个爬虫类
 │   ├── anti_crawler.py         # 反爬虫策略（DrissionPage接管Chrome、自动化滑块验证码处理）
 │   ├── hotel_list_crawler.py   # 酒店列表爬虫（分层抽样策略实现）
-│   └── review_crawler.py       # 评论爬虫（瀑布流采集策略实现）
+│   └── review_crawler.py       # 评论爬虫（双池策略：negative自动 / positive人工辅助）
 │
 ├── database/                    # 数据库模块
 │   ├── __init__.py             # 模块初始化，导出ORM模型和连接函数
 │   ├── connection.py           # 数据库连接管理（SQLAlchemy引擎、会话）
-│   ├── models.py               # ORM模型定义（Hotel、Review、CrawlTask等6张表）
+│   ├── models.py               # ORM模型定义（Hotel、Review、ReviewNegative、ReviewPositive）
 │   └── init_db.sql             # PostgreSQL初始化脚本（含索引、视图、触发器）
 │
 ├── utils/                       # 工具模块
@@ -57,10 +57,6 @@ HotelReviewCrawing/
 │   ├── logger.py               # 日志配置（Loguru，按天轮转，错误日志分离）
 │   ├── cleaner.py              # 数据清洗（HTML清理、评分解析、日期解析）
 │   └── validator.py            # Pydantic数据验证模型（HotelModel、ReviewModel）
-│
-├── scheduler/                   # 任务调度模块
-│   ├── __init__.py             # 模块初始化
-│   └── task_scheduler.py       # 任务管理器（创建、执行、状态跟踪、统计）
 │
 ├── tests/                       # 测试模块
 │   ├── __init__.py
@@ -176,12 +172,25 @@ python main.py --mode hotel_list --all
 
 #### 爬取评论
 ```bash
-# 爬取指定酒店的评论
+# 爬取指定酒店评论（negative自动 + positive人工辅助）
 python main.py --mode reviews --hotel-id 10019773
 
-# 爬取所有酒店的评论
+# 仅爬取指定酒店的负向评论
+python main.py --mode reviews --hotel-id 10019773 --negative-only
+
+# 明确启用正向人工辅助模式
+python main.py --mode reviews --hotel-id 10019773 --positive-manual
+
+# 爬取所有酒店的负向评论
 python main.py --mode reviews --all
 ```
+
+正向人工辅助模式说明：
+
+1. 程序会自动进入酒店评论页，并尽量切到“好评”视图。
+2. 终端会提示你手工翻页或确认当前页已渲染完成。
+3. 每按一次 Enter，程序会抓取当前页评论 HTML、去重、过滤掉非正向评论后保存。
+4. 输入 `s` 可跳过当前页，输入 `q` 可结束正向采集。
 
 #### 查看帮助
 ```bash
@@ -210,25 +219,49 @@ python main.py --help
 - 高档型 (600-1200元): 每商圈Top 3，按销量排序
 - 奢华型 (1200元+): 每商圈Top 2，按综合排序
 
-### 阶段二：评论详情采集（瀑布流策略）
+### 阶段二：评论详情采集（双池策略 + 动态质量控制）
 
-每家酒店最多采集300条评论，按优先级依次采集：
+每家酒店当前采用双池策略：
 
-| 优先级 | 来源池 | 筛选条件 | 上限 | 目的 |
-|--------|--------|----------|------|------|
-| 1 | 负面警示池 | 差评(1-2分) + 中评(3分) | 100条 | 挖掘酒店具体缺点 |
-| 2 | 高质量证据池 | 有图/视频评论 | 150条 | RAG检索素材 |
-| 3 | 时效性补全池 | 全部评论（最新） | 剩余配额 | 保证评论时效性 |
+| 池名 | 方式 | 目标 | 说明 |
+|------|------|------|------|
+| `negative` | 全自动 | 差评在线主采 | 先按动态负评软目标抓取，再根据实际可得性接受短缺 |
+| `positive` | 半自动 | 正向评论补充 | 人工翻页/渲染，程序负责 HTML 提取、去重、质量筛选和入库 |
 
-**熔断机制**: 评论数少于50条的酒店直接跳过
+说明：
+- 单酒店默认启用 `positive` 人工辅助模式
+- 批量 `--all` 默认只跑 `negative`
+- 单酒店总评论目标不再固定为 300，而是根据 `review_count` 动态计算
+- 评论会先做信息量分层：优先保留中长、高信息评论；数量不足时再按酒店评论量分档动态放宽
+- 评论数少于阈值的酒店仍会被记录告警，但不强制跳过
 
 ### 阶段三：数据清洗与存储
 
 - **数据验证**: Pydantic模型校验
 - **文本清洗**: 去HTML标签、规范化空白、提取标签
+- **信息量分层**: 计算有效长度、方面词命中数、质量等级（S/A/B/C/D）
+- **动态放宽**: 高评论量酒店更严格，低评论量酒店允许少量“短但具体”的评论进入
 - **评分解析**: CSS width百分比转换为1-5分
 - **去重检查**: 基于review_id去重
 - **入库存储**: SQLAlchemy ORM批量写入
+
+### 关键评论调参项
+
+以下配置是当前评论采集最常调整的几组参数，建议优先通过 `.env` 调整：
+
+| 参数 | 作用 | 调大后效果 | 调小后效果 |
+|------|------|-----------|-----------|
+| `REVIEW_TOTAL_SAMPLE_RATIO` | 单酒店动态总量比例 | 每家酒店抓得更深 | 每家酒店抓得更浅 |
+| `REVIEW_NEGATIVE_TARGET_RATIO` | 负评软目标比例 | 负评占比更高 | 更偏向正评与主流体验 |
+| `REVIEW_POSITIVE_MIN_EFFECTIVE_LEN` | 正评默认最低有效长度 | 正评更偏长评论、证据更充分 | 更容易保留短正评 |
+| `REVIEW_NEGATIVE_MIN_EFFECTIVE_LEN` | 负评默认最低有效长度 | 负评更严格 | 更容易保留短问题评论 |
+| `REVIEW_SHORT_COMMENT_MAX_RATIO_HIGH/MID/LOW` | 各评论量档位短评占比上限 | 更容易放宽短评 | 更强调中长评论 |
+| `REVIEW_QUALITY_RELAX_TRIGGER_RATIO` | 进入放宽阶段的触发阈值 | 更早放宽，覆盖更全 | 更晚放宽，质量更高 |
+
+经验建议：
+- 如果知识库里“空泛好评”过多，优先提高 `REVIEW_POSITIVE_MIN_EFFECTIVE_LEN`
+- 如果低评论量酒店有效评论太少，优先提高 `REVIEW_SHORT_COMMENT_MAX_RATIO_LOW`
+- 如果负评明显抓不到，优先降低 `REVIEW_NEGATIVE_MIN_EFFECTIVE_LEN`
 
 ### 验证码自动化处理
 
@@ -256,7 +289,7 @@ CAPTCHA_REFRESH_RETRY_LIMIT = 2  # 验证页刷新次数
 
 **恢复机制**:
 - 酒店列表：每页保存，中断后从下一页继续
-- 评论采集：每池保存，已完成的池不会重新采集
+- 评论采集：负向池分段保存，正向人工辅助页按当前页提取
 
 ## 技术栈
 
@@ -277,11 +310,11 @@ CAPTCHA_REFRESH_RETRY_LIMIT = 2  # 验证页刷新次数
 | 表名 | 说明 | 主要字段 |
 |------|------|----------|
 | `hotels` | 酒店基础信息 | hotel_id, name, address, rating_score, region_type, price_level |
-| `reviews` | 评论主表 | review_id, hotel_id, content, score_*, source_pool |
-| `review_images` | 评论图片 | review_id, image_url, thumbnail_url |
-| `review_replies` | 商家回复 | review_id, content, reply_date |
-| `crawl_tasks` | 爬取任务 | task_id, task_type, status, priority |
-| `crawl_logs` | 爬取日志 | task_id, level, message, details |
+| `reviews` | 评论主表（全部评论） | review_id, hotel_id, content, score_*, source_pool |
+| `reviews_negative` | 负面评论子表 | review_id, hotel_id, content, overall_score, review_date |
+| `reviews_positive` | 正面评论子表 | review_id, hotel_id, content, overall_score, review_date |
+
+说明：当前双池策略仅将文本评论和必要元数据写入数据库，图片、商家回复、任务日志与任务表均已从活跃架构中移除。
 
 详细Schema设计请参考 [plans/02_数据库Schema设计.md](plans/02_数据库Schema设计.md)
 
@@ -357,9 +390,3 @@ instruction_data = {
 ## 许可证
 
 本项目仅用于个人学术研究，不得用于商业用途。
-
----
-
-**作者**：Marcus Ao
-**最后更新**: 2026-01-25
-**版本**: v1.0

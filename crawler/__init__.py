@@ -13,6 +13,7 @@ from .exceptions import (
     NavigationException,
     DataExtractionException,
     BrowserConnectionException,
+    RecoverableInterruption,
 )
 
 __all__ = [
@@ -29,4 +30,5 @@ __all__ = [
     'NavigationException',
     'DataExtractionException',
     'BrowserConnectionException',
+    'RecoverableInterruption',
 ]

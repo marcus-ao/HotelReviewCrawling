@@ -41,8 +41,7 @@ venv*
 .sisyphus/
 
 # Logs
-logs/*.log
-*.log
+logs/
 
 # Data files
 data/raw/*

@@ -4,7 +4,7 @@ from typing import Any, Callable, Optional
 
 from config.settings import settings
 from database.connection import session_scope
-from database.models import CrawlLog, Hotel
+from database.models import Hotel
 from utils.validator import HotelModel
 
 
@@ -33,39 +33,6 @@ def count_region_tier_hotels(region_type: str, price_level: str) -> int:
             Hotel.region_type == region_type,
             Hotel.price_level == price_level,
         ).count()
-
-
-def record_sampling_audit(
-    session: Any,
-    hotel_data: dict,
-    sample_source: str,
-    min_review_count: int,
-    borrow_for_region: Optional[str] = None,
-) -> None:
-    """Persist per-hotel sampling source for auditability."""
-    hotel_id = hotel_data.get("hotel_id")
-    if not hotel_id:
-        return
-
-    details: dict[str, Any] = {
-        "hotel_id": hotel_id,
-        "region_type": hotel_data.get("region_type"),
-        "business_zone_code": hotel_data.get("business_zone_code"),
-        "price_level": hotel_data.get("price_level"),
-        "sample_source": sample_source,
-        "min_review_threshold": min_review_count,
-    }
-    if borrow_for_region:
-        details["borrow_for_region"] = borrow_for_region
-
-    session.add(
-        CrawlLog(
-            task_id=f"sampling:{hotel_id}",
-            level="INFO",
-            message="hotel_sampling_source",
-            details=details,
-        )
-    )
 
 
 def save_hotels(
@@ -184,24 +151,10 @@ def save_hotels(
                         first_existing.price_level = mapped_level
 
                     updated_count += 1
-                    record_sampling_audit(
-                        session=session,
-                        hotel_data=validated_dump,
-                        sample_source=sample_source,
-                        min_review_count=min_review_count,
-                        borrow_for_region=borrow_for_region,
-                    )
                     logger.debug(f"更新酒店基本信息: {validated.name}")
                 else:
                     session.add(Hotel(**validated.model_dump()))
                     saved_count += 1
-                    record_sampling_audit(
-                        session=session,
-                        hotel_data=validated.model_dump(),
-                        sample_source=sample_source,
-                        min_review_count=min_review_count,
-                        borrow_for_region=borrow_for_region,
-                    )
                     logger.debug(
                         f"新增酒店: {validated.name} "
                         f"(商圈:{business_zone_code}, 价格档次:{price_level})"

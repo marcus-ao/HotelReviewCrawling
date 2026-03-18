@@ -1,11 +1,11 @@
-"""数据验证模型模块"""
+"""数据验证模型模块。"""
 from datetime import datetime
 from typing import Optional
 from pydantic import BaseModel, Field, field_validator
 
 
 class HotelModel(BaseModel):
-    """酒店数据验证模型"""
+    """酒店数据验证模型。"""
 
     hotel_id: str = Field(..., description="酒店ID (shid)")
     name: str = Field(..., min_length=1, max_length=200, description="酒店名称")
@@ -38,7 +38,7 @@ class HotelModel(BaseModel):
 
 
 class ReviewModel(BaseModel):
-    """评论数据验证模型"""
+    """评论数据验证模型。"""
 
     review_id: Optional[str] = Field(None, description="评论ID")
     hotel_id: str = Field(..., description="酒店ID")
@@ -51,14 +51,9 @@ class ReviewModel(BaseModel):
     score_value: Optional[float] = Field(None, ge=0, le=5, description="性价比评分")
     overall_score: Optional[float] = Field(None, ge=0, le=5, description="综合评分")
     tags: Optional[list[str]] = Field(default_factory=list, description="标签列表")
-    has_images: bool = Field(default=False, description="是否有图片")
-    image_urls: Optional[list[str]] = Field(default_factory=list, description="图片URL列表")
     review_date: Optional[datetime] = Field(None, description="评论日期")
     room_type: Optional[str] = Field(None, description="房型")
-    has_reply: bool = Field(default=False, description="是否有商家回复")
-    reply_content: Optional[str] = Field(None, description="商家回复内容")
-    reply_date: Optional[datetime] = Field(None, description="回复日期")
-    source_pool: Optional[str] = Field(None, description="来源池(negative/evidence/latest)")
+    source_pool: Optional[str] = Field(None, description="来源池(negative/positive)")
 
     @field_validator('hotel_id')
     @classmethod
@@ -75,7 +70,7 @@ class ReviewModel(BaseModel):
         return v.strip()
 
     def calculate_overall_score(self) -> float:
-        """计算综合评分"""
+        """计算综合评分。"""
         scores = [
             self.score_clean,
             self.score_location,
@@ -86,20 +81,3 @@ class ReviewModel(BaseModel):
         if valid_scores:
             return round(sum(valid_scores) / len(valid_scores), 1)
         return 0.0
-
-
-class CrawlTaskModel(BaseModel):
-    """爬取任务验证模型"""
-
-    task_id: Optional[str] = Field(None, description="任务ID")
-    task_type: str = Field(..., description="任务类型(hotel_list/review)")
-    region_type: Optional[str] = Field(None, description="功能区类型")
-    business_zone_code: Optional[str] = Field(None, description="商圈代码")
-    hotel_id: Optional[str] = Field(None, description="酒店ID(评论任务)")
-    price_level: Optional[str] = Field(None, description="价格档次")
-    status: str = Field(default="pending", description="任务状态")
-    priority: int = Field(default=0, ge=0, description="优先级")
-    retry_count: int = Field(default=0, ge=0, description="重试次数")
-    error_message: Optional[str] = Field(None, description="错误信息")
-    created_at: Optional[datetime] = Field(None, description="创建时间")
-    updated_at: Optional[datetime] = Field(None, description="更新时间")
